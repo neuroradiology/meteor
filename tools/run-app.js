@@ -13,6 +13,8 @@ var buildmessage = require('./buildmessage.js');
 var runLog = require('./run-log.js');
 var catalog = require('./catalog.js');
 var stats = require('./stats.js');
+var cordova = require('./commands-cordova.js');
+var Console = require('./console.js').Console;
 
 // Parse out s as if it were a bash command line.
 var bashParse = function (s) {
@@ -51,21 +53,23 @@ var getNodeOptionsFromEnvironment = function () {
 var AppProcess = function (options) {
   var self = this;
 
+  self.appDir = options.appDir;
   self.bundlePath = options.bundlePath;
   self.port = options.port;
   self.listenHost = options.listenHost;
   self.rootUrl = options.rootUrl;
   self.mongoUrl = options.mongoUrl;
   self.oplogUrl = options.oplogUrl;
+  self.mobileServerUrl = options.mobileServerUrl;
 
   self.onExit = options.onExit;
   self.onListen = options.onListen;
   self.program = options.program || null;
   self.nodeOptions = options.nodeOptions || [];
+  self.debugPort = options.debugPort;
   self.settings = options.settings;
 
   self.proc = null;
-  self.keepaliveTimer = null;
   self.madeExitCallback = false;
 };
 
@@ -94,12 +98,21 @@ _.extend(AppProcess.prototype, {
         // This is the child process telling us that it's ready to
         // receive connections.
         self.onListen && self.onListen();
+
       } else {
         runLog.logAppOutput(line);
       }
     }));
 
     eachline(self.proc.stderr, 'utf8', fiberHelpers.inBareFiber(function (line) {
+      if (self.debugPort &&
+          line.indexOf("debugger listening on port " + self.debugPort) >= 0) {
+        Console.enableProgressDisplay(false);
+        process.stdout.write(
+          require("./inspector.js").banner(self.debugPort)
+        );
+      }
+
       runLog.logAppOutput(line, true);
     }));
 
@@ -124,16 +137,12 @@ _.extend(AppProcess.prototype, {
     // http://stackoverflow.com/questions/2893458/uncatchable-errors-in-node-js
     self.proc.stdin.on('error', function () {});
 
-    // Keepalive so child process can detect when we die
-    self.keepaliveTimer = setInterval(function () {
-      try {
-        if (self.proc && self.proc.pid &&
-            self.proc.stdin && self.proc.stdin.write)
-          self.proc.stdin.write('k');
-      } catch (e) {
-        // do nothing. this fails when the process dies.
-      }
-    }, 2000);
+    // When the parent process exits (i.e. the server is shutting down and
+    // not merely restarting), make sure to disconnect any still-connected
+    // shell clients.
+    require("./cleanup.js").onExit(function() {
+      require("./server/shell.js").unlinkSocketFile(self.appDir);
+    });
   },
 
   _maybeCallOnExit: function (code, signal) {
@@ -156,10 +165,6 @@ _.extend(AppProcess.prototype, {
     }
     self.proc = null;
 
-    if (self.keepaliveTimer)
-      clearInterval(self.keepaliveTimer);
-    self.keepaliveTimer = null;
-
     self.onListen = null;
     self.onExit = null;
   },
@@ -171,6 +176,11 @@ _.extend(AppProcess.prototype, {
     env.PORT = self.port;
     env.ROOT_URL = self.rootUrl;
     env.MONGO_URL = self.mongoUrl;
+    if (self.mobileServerUrl) {
+      env.MOBILE_DDP_URL = self.mobileServerUrl;
+      env.MOBILE_ROOT_URL = self.mobileServerUrl;
+    }
+
     if (self.oplogUrl) {
       env.MONGO_OPLOG_URL = self.oplogUrl;
     }
@@ -184,6 +194,7 @@ _.extend(AppProcess.prototype, {
     } else {
       delete env.BIND_IP;
     }
+    env.APP_ID = project.appId;
 
     // Display errors from (eg) the NPM connect module over the network.
     env.NODE_ENV = 'development';
@@ -191,6 +202,8 @@ _.extend(AppProcess.prototype, {
     // the HTTP forwarded count.
     env.HTTP_FORWARDED_COUNT =
       "" + ((parseInt(process.env['HTTP_FORWARDED_COUNT']) || 0) + 1);
+
+    env.ENABLE_METEOR_SHELL = 'true';
 
     return env;
   },
@@ -206,8 +219,17 @@ _.extend(AppProcess.prototype, {
     if (! self.program) {
       // Old-style bundle
       var opts = _.clone(self.nodeOptions);
-      opts.push(path.join(self.bundlePath, 'main.js'));
-      opts.push('--keepalive');
+
+      if (self.debugPort) {
+        require("./inspector.js").start(self.debugPort);
+        opts.push("--debug-brk=" + self.debugPort);
+      }
+
+      opts.push(
+        path.join(self.bundlePath, 'main.js'),
+        '--parent-pid',
+        process.env.METEOR_BAD_PARENT_PID_FOR_TEST ? "foobar" : process.pid
+      );
 
       return child_process.spawn(process.execPath, opts, {
         env: self._computeEnvironment()
@@ -327,8 +349,10 @@ var AppRunner = function (appDir, options) {
   self.oplogUrl = options.oplogUrl;
   self.buildOptions = options.buildOptions;
   self.rootUrl = options.rootUrl;
+  self.mobileServerUrl = options.mobileServerUrl;
   self.settingsFile = options.settingsFile;
   self.program = options.program;
+  self.debugPort = options.debugPort;
   self.proxy = options.proxy;
   self.watchForChanges =
     options.watchForChanges === undefined ? true : options.watchForChanges;
@@ -336,6 +360,14 @@ var AppRunner = function (appDir, options) {
   self.noRestartBanner = options.noRestartBanner;
   self.recordPackageUsage =
     options.recordPackageUsage === undefined ? true : options.recordPackageUsage;
+
+  // Keep track of the app's Cordova plugins and platforms. If the set
+  // of plugins or platforms changes from one run to the next, we just
+  // exit, because we don't yet have a way to, for example, get the new
+  // plugins to the mobile clients or stop a running client on a
+  // platform that has been removed.
+  self.cordovaPlugins = null;
+  self.cordovaPlatforms = null;
 
   self.fiber = null;
   self.startFuture = null;
@@ -389,30 +421,50 @@ _.extend(AppRunner.prototype, {
 
   // Run the program once, wait for it to exit, and then return. The
   // return value is same as onRunEnd.
-  _runOnce: function (onListen) {
+  _runOnce: function (options) {
     var self = this;
+    options = options || {};
 
-    // We need to reset our workspace for hotcodepush. Specifically, we need to
-    // tell the catalog to reload local package sources (since their
-    // dependencies may have changed), and then we should recompute the project
-    // constraints.
-    // XXX the catalog refresh seems overly conservative, but who knows
-    var refreshWatchSet = new watch.WatchSet;
-    var refreshMessages = buildmessage.capture(function () {
-      catalog.complete.refresh({ forceRefresh: true,
-                                 watchSet: refreshWatchSet});
-    });
-    if (refreshMessages.hasMessages()) {
-      return {
-        outcome: 'bundle-fail',
-        bundleResult: {
-          errors: refreshMessages,
-          serverWatchSet: refreshWatchSet
+    Console.enableProgressDisplay(true);
+
+    if (!options.firstRun) {
+      // We need to reset our workspace for subsequent builds. Specifically, we
+      // need to tell the catalog to reload local package sources (since their
+      // dependencies may have changed), and then we should recompute the
+      // project constraints.
+      //
+      // XXX This is almost certainly both overly conservative and not
+      // conservative enough. On the one hand,
+      // catalog.complete.refreshLocalPackages is a slow operation and it's
+      // likely that the existing buildinfo/watcher code with some extensions
+      // can detect relevant changes more precisely. On the other hand, we DON'T
+      // use this blunt hammer when only the client code has changed, which
+      // might not be good enough.  We need to take a thorough pass over all the
+      // package build/metadata caching mechanisms and come up with a unified
+      // system that flushes caches only when actually necessary.
+      var refreshWatchSet = new watch.WatchSet;
+      var refreshMessages = buildmessage.capture(function () {
+        try {
+          catalog.complete.refreshLocalPackages({
+            watchSet: refreshWatchSet
+          });
+        } catch (err) {
+          // XXX: Should we throw here?
+          // XXX: Should we remove this entirely?
+          Console.debug("Ignoring error updating package catalog", err);
         }
-      };
+      });
+      if (refreshMessages.hasMessages()) {
+        return {
+          outcome: 'bundle-fail',
+          bundleResult: {
+            errors: refreshMessages,
+            serverWatchSet: refreshWatchSet
+          }
+        };
+      }
+      project.reload();
     }
-
-    project.reload();
 
     runLog.clearLog();
     self.proxy.setMode("hold");
@@ -426,19 +478,10 @@ _.extend(AppRunner.prototype, {
     // you are testing packages from an app and you 'meteor update'
     // that app.
     if (self.appDirForVersionCheck) {
-      var wrongRelease;
-      var rightReleaseMessages = buildmessage.capture(function () {
-        wrongRelease = ! release.usingRightReleaseForApp();
-      });
-      if (rightReleaseMessages.hasMessages()) {
-        return {
-          outcome: 'bundle-fail',
-          bundleResult: { errors: rightReleaseMessages }
-        };
-      }
+      var wrongRelease = ! release.usingRightReleaseForApp();
       if (wrongRelease) {
         return { outcome: 'wrong-release',
-                 releaseNeeded: project.getMeteorReleaseVersion()
+                 releaseNeeded: project.getNormalizedMeteorReleaseVersion()
                };
       }
     }
@@ -446,14 +489,7 @@ _.extend(AppRunner.prototype, {
     // Bundle up the app
     var bundlePath = path.join(self.appDir, '.meteor', 'local', 'build');
     if (self.recordPackageUsage) {
-      var statsMessages = buildmessage.capture(function () {
-        stats.recordPackages("sdk.run");
-      });
-      if (statsMessages.hasMessages()) {
-        process.stdout.write("Error recording package list:\n" +
-                             statsMessages.formatMessages());
-        // ... but continue;
-      }
+      stats.recordPackages("sdk.run");
     }
 
     // Cache the server target because the server will not change inside
@@ -493,13 +529,35 @@ _.extend(AppRunner.prototype, {
       };
     }
 
+    var plugins = cordova.getCordovaDependenciesFromStar(
+      bundleResult.starManifest);
+
+    if (self.cordovaPlugins && ! _.isEqual(self.cordovaPlugins, plugins)) {
+      return {
+        outcome: 'outdated-cordova-plugins',
+        bundleResult: bundleResult
+      };
+    }
+    self.cordovaPlugins = plugins;
+
+    var platforms = project.getCordovaPlatforms();
+    platforms.sort();
+    if (self.cordovaPlatforms &&
+        ! _.isEqual(self.cordovaPlatforms, platforms)) {
+      return {
+        outcome: 'outdated-cordova-platforms',
+        bundleResult: bundleResult
+      };
+    }
+    self.cordovaPlatforms = platforms;
+
     var serverWatchSet = bundleResult.serverWatchSet;
 
     // Read the settings file, if any
     var settings = null;
     var settingsWatchSet = new watch.WatchSet;
     var settingsMessages = buildmessage.capture({
-      title: "preparing to run",
+      title: "Preparing to run",
       rootPath: process.cwd()
     }, function () {
       if (self.settingsFile)
@@ -530,13 +588,16 @@ _.extend(AppRunner.prototype, {
     var runFuture = self.runFuture = new Future;
 
     // Run the program
+    options.beforeRun && options.beforeRun();
     var appProcess = new AppProcess({
+      appDir: self.appDir,
       bundlePath: bundlePath,
       port: self.port,
       listenHost: self.listenHost,
       rootUrl: self.rootUrl,
       mongoUrl: self.mongoUrl,
       oplogUrl: self.oplogUrl,
+      mobileServerUrl: self.mobileServerUrl,
       onExit: function (code, signal) {
         self._runFutureReturn({
           outcome: 'terminated',
@@ -546,9 +607,10 @@ _.extend(AppRunner.prototype, {
         });
       },
       program: self.program,
+      debugPort: self.debugPort,
       onListen: function () {
         self.proxy.setMode("proxy");
-        onListen && onListen();
+        options.onListen && options.onListen();
         if (self.startFuture)
           self.startFuture['return']();
       },
@@ -595,6 +657,8 @@ _.extend(AppRunner.prototype, {
       setupClientWatcher();
     }
 
+    Console.enableProgressDisplay(false);
+
     // Wait for either the process to exit, or (if watchForChanges) a
     // source file to change. Or, for stop() to be called.
     var ret = runFuture.wait();
@@ -614,7 +678,7 @@ _.extend(AppRunner.prototype, {
         var oldFuture = self.runFuture = new Future;
 
         // Notify the server that new client assets have been added to the build.
-        process.kill(appProcess.proc.pid, 'SIGUSR2');
+        appProcess.proc.kill('SIGUSR2');
 
         // Establish a watcher on the new files.
         setupClientWatcher();
@@ -626,6 +690,10 @@ _.extend(AppRunner.prototype, {
       }
     } finally {
       self.runFuture = null;
+
+      if (ret.outcome === 'changed') {
+        runLog.logTemporary("=> Server modified -- restarting...");
+      }
 
       self.proxy.setMode("hold");
       appProcess.stop();
@@ -663,14 +731,20 @@ _.extend(AppRunner.prototype, {
     var firstRun = true;
 
     while (true) {
-      crashTimer = setTimeout(function () {
-        crashCount = 0;
-      }, 3000);
 
-      var runResult = self._runOnce(function () {
-        /* onListen */
-        if (! self.noRestartBanner && ! firstRun)
-          runLog.logRestart();
+      var resetCrashCount = function () {
+        crashTimer = setTimeout(function () {
+          crashCount = 0;
+        }, 3000);
+      };
+
+      var runResult = self._runOnce({
+        onListen: function () {
+          if (! self.noRestartBanner && ! firstRun)
+            runLog.logRestart();
+        },
+        beforeRun: resetCrashCount,
+        firstRun: firstRun
       });
       firstRun = false;
 
@@ -695,9 +769,11 @@ _.extend(AppRunner.prototype, {
       else if (runResult.outcome === "bundle-fail") {
         runLog.log("=> Errors prevented startup:\n\n" +
                         runResult.bundleResult.errors.formatMessages());
-        if (self.watchForChanges)
+        if (self.watchForChanges) {
           runLog.log("=> Your application has errors. " +
                      "Waiting for file change.");
+          Console.enableProgressDisplay(false);
+        }
       }
 
       else if (runResult.outcome === "changed")
@@ -716,9 +792,11 @@ _.extend(AppRunner.prototype, {
         if (crashCount < 3)
           continue;
 
-        if (self.watchForChanges)
+        if (self.watchForChanges) {
           runLog.log("=> Your application is crashing. " +
                      "Waiting for file change.");
+          Console.enableProgressDisplay(false);
+        }
       }
 
       else {
@@ -747,6 +825,7 @@ _.extend(AppRunner.prototype, {
         if (self.exitFuture)
           break;
         runLog.log("=> Modified -- restarting.");
+        Console.enableProgressDisplay(true);
         continue;
       }
 

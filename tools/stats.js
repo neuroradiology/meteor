@@ -11,6 +11,7 @@ var ServiceConnection = require("./service-connection.js");
 var release = require("./release.js");
 var buildmessage = require("./buildmessage.js");
 var httpHelpers = require("./http-helpers.js");
+var Console = require("./console.js").Console;
 
 // The name of the package that you add to your app to opt out of
 // sending stats.
@@ -35,15 +36,11 @@ var optOutPackageName = "package-stats-opt-out";
 // that it is pointing to a root directory with an existing
 // .meteor/versions file.
 var packageList = function (_currentProjectForTest) {
-  buildmessage.assertInCapture();
   var directDeps = (_currentProjectForTest || project.project).getConstraints();
 
-  var versions;
-  if (_currentProjectForTest) {
-    versions = _currentProjectForTest.dependencies;
-  } else {
-    versions = project.project.getVersions();
-  }
+  var versions = (_currentProjectForTest || project.project).getVersions({
+    dontRunConstraintSolver: true
+  });
 
   return _.map(
     versions,
@@ -61,7 +58,6 @@ var packageList = function (_currentProjectForTest) {
 // If it's a deploy, 'site' should be the name of the site
 // ("foo.meteor.com") that we're deploying to.
 var recordPackages = function (what, site) {
-  buildmessage.assertInCapture();
   // Before doing anything, look at the app's dependencies to see if the
   // opt-out package is there; if present, we don't record any stats.
   var packages = packageList();
@@ -137,10 +133,11 @@ var recordPackages = function (what, site) {
 
 var logErrorIfInCheckout = function (err) {
   if (files.inCheckout()) {
-    process.stderr.write("Failed to record package usage.\n");
-    process.stderr.write("(This error is hidden when you are not running Meteor from a checkout.)\n");
-    process.stderr.write(err.stack || err);
-    process.stderr.write("\n\n");
+    Console.stderr.write("Failed to record package usage.\n");
+    Console.stderr.write(
+      "(This error is hidden when you are not running Meteor from a checkout.)\n");
+    Console.stderr.write(err.stack || err);
+    Console.stderr.write("\n\n");
   }
 };
 
@@ -165,7 +162,7 @@ var getPackagesForAppIdInTest = function (currentProject) {
 
 var connectToPackagesStatsServer = function () {
   var Package = uniload.load({
-    packages: ["livedata"]
+    packages: ["meteor", "ddp"]
   });
   var conn = new ServiceConnection(
     Package,

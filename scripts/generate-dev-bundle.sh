@@ -71,6 +71,31 @@ umask 022
 mkdir build
 cd build
 
+# ios-sim is used to run iPhone simulator from the command-line. Doesn't make
+# sense to build it for linux.
+if [ "$OS" == "osx" ]; then
+    # the build from source is not going to work on old OS X versions, until we
+    # upgrade our Mac OS X Jenkins machine, download the precompiled tarball
+
+    # which rake # rake is required to build ios-sim
+    # git clone https://github.com/phonegap/ios-sim.git
+    # cd ios-sim
+    # git checkout 2.0.1
+    # rake build
+    # which build/Release/ios-sim # check that we have in fact got the binary
+    # mkdir -p "$DIR/lib/ios-sim"
+    # cp -r build/Release/* "$DIR/lib/ios-sim/"
+
+    # Download the precompiled tarball
+    IOS_SIM_URL="http://android-bundle.s3.amazonaws.com/ios-sim.tgz"
+    curl "$IOS_SIM_URL" | tar xfz -
+    mkdir -p "$DIR/lib/ios-sim"
+    cp -r ios-sim/ios-sim "$DIR/lib/ios-sim"
+fi
+
+
+cd "$DIR/build"
+
 # For now, use our fork with https://github.com/npm/npm/pull/5821/files
 git clone https://github.com/meteor/node.git
 cd node
@@ -130,11 +155,27 @@ mv ../$FIBERS_ARCH .
 # tool (and not by the bundled app boot.js script).
 cd "${DIR}/lib"
 npm install request@2.33.0
+
 npm install fstream@1.0.2
+
 npm install tar@1.0.1
+
 npm install kexec@0.2.0
+
 npm install source-map@0.1.32
+
 npm install browserstack-webdriver@2.41.1
+rm -rf node_modules/browserstack-webdriver/docs
+rm -rf node_modules/browserstack-webdriver/lib/test
+
+npm install node-inspector@0.7.4
+
+npm install chalk@0.5.1
+
+npm install sqlite3@3.0.0
+rm -rf node_modules/sqlite3/deps
+
+npm install netroute@0.2.5
 
 # Clean up a big zip file it leaves behind.
 npm install phantomjs@1.8.1-1
@@ -147,10 +188,31 @@ npm install https://github.com/meteor/node-http-proxy/tarball/99f757251b42aeb5d2
 # NPM version now. (For that matter, we ought to be able to get this from
 # the copy in js-analyze rather than in the dev bundle.)
 npm install https://github.com/ariya/esprima/tarball/5044b87f94fb802d9609f1426c838874ec2007b3
+rm -rf node_modules/esprima/test
 
 # 2.4.0 (more or less, the package.json change isn't committed) plus our PR
 # https://github.com/williamwicks/node-eachline/pull/4
 npm install https://github.com/meteor/node-eachline/tarball/ff89722ff94e6b6a08652bf5f44c8fffea8a21da
+
+# Cordova npm tool for mobile integration
+# XXX We install our own fork of cordova because we need a particular patch that
+# didn't land to cordova-android yet. As soon as it lands, we can switch back to
+# upstream.
+# https://github.com/apache/cordova-android/commit/445ddd89fb3269a772978a9860247065e5886249
+#npm install cordova@3.5.0-0.2.6
+npm install "https://github.com/meteor/cordova-cli/tarball/0c9b3362c33502ef8f6dba514b87279b9e440543"
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/browser-pack/node_modules/JSONStream/test/fixtures
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/browserify-zlib/node_modules/pako/benchmark
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/browserify-zlib/node_modules/pako/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/buffer/perf
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/crypto-browserify/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/derequire/node_modules/esprima-fb/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/derequire/node_modules/esrefactor/node_modules/esprima/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/insert-module-globals/node_modules/lexical-scope/node_modules/astw/node_modules/esprima-fb/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/module-deps/node_modules/detective/node_modules/escodegen/node_modules/esprima/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/module-deps/node_modules/detective/node_modules/esprima-fb/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/syntax-error/node_modules/esprima-fb/test
+rm -rf node_modules/cordova/node_modules/cordova-lib/node_modules/cordova-js/node_modules/browserify/node_modules/umd/node_modules/ruglify/test
 
 # Checkout and build mongodb.
 # We want to build a binary that includes SSL support but does not depend on a

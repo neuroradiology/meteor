@@ -17,7 +17,7 @@ var stats = require('./stats.js');
 // a bit of a hack
 var getPackage = function () {
   return uniload.load({
-    packages: [ 'meteor', 'livedata' ]
+    packages: [ 'meteor', 'ddp' ]
   });
 };
 
@@ -202,17 +202,11 @@ exports.deploy = function (options) {
 
     if (! options.starball && ! messages.hasMessages()) {
       process.stdout.write('Deploying ' + options.app + '. Bundling...\n');
-      var statsMessages = buildmessage.capture(function () {
-        stats.recordPackages("sdk.deploy", options.app);
-      });
-      if (statsMessages.hasMessages()) {
-        process.stdout.write("Error recording package list:\n" +
-                             statsMessages.formatMessages());
-        // ... but continue;
-      }
+      stats.recordPackages("sdk.deploy", options.app);
       var bundleResult = bundler.bundle({
         outputPath: bundlePath,
-        buildOptions: options.buildOptions
+        buildOptions: options.buildOptions,
+        requireControlProgram: true
       });
 
       if (bundleResult.errors) {

@@ -16,8 +16,9 @@ var util = require('util');
 var child_process = require('child_process');
 var webdriver = require('browserstack-webdriver');
 var phantomjs = require('phantomjs');
-
+var catalogRemote = require('./catalog-remote.js');
 var Package = uniload.load({ packages: ["ejson"] });
+var Console = require('./console.js').Console;
 
 var toolPackageName = "meteor-tool";
 
@@ -80,10 +81,10 @@ var getToolsPackage = function () {
 };
 
 // Execute a command synchronously, discarding stderr.
-var execFileSync = function (binary, args) {
+var execFileSync = function (binary, args, opts) {
   return Future.wrap(function(cb) {
     var cb2 = function(err, stdout, stderr) { cb(err, stdout); };
-    child_process.execFile(binary, args, cb2);
+    child_process.execFile(binary, args, opts, cb2);
   })().wait();
 };
 
@@ -159,8 +160,10 @@ _.extend(Matcher.prototype, {
   matchEmpty: function () {
     var self = this;
 
-    if (self.buf.length > 0)
+    if (self.buf.length > 0) {
+      console.log("Extra junk is ", self.buf);
       throw new TestFailure('junk-at-end', { run: self.run });
+    }
   },
 
   _tryMatch: function () {
@@ -377,7 +380,7 @@ var Sandbox = function (options) {
   // assume that the release's packages can be found on the server should not.
   // Note that this only affects subprocess meteor runs, not direct invocation
   // of packageClient!
-  if (runningTest.tags['test-package-server']) {
+  if (_.contains(runningTest.tags, 'test-package-server')) {
     self.set('METEOR_PACKAGE_SERVER_URL', exports.testPackageServerUrl);
   }
 
@@ -388,16 +391,33 @@ var Sandbox = function (options) {
     self._makeWarehouse(options.warehouse);
   }
 
-  self.clients = [ new PhantomClient({
+  self.clients = [new PhantomClient({
     host: 'localhost',
     port: options.clients.port || 3000
   })];
 
   if (options.clients && options.clients.browserstack) {
-    self.clients.push(new BrowserStackClient({
-      host: 'localhost',
-      port: options.clients.port || 3000
-    }));
+    var browsers = [
+      { browserName: 'firefox' },
+      { browserName: 'chrome' },
+      { browserName: 'internet explorer',
+        browserVersion: '11' },
+      { browserName: 'internet explorer',
+        browserVersion: '8',
+        timeout: 60 },
+      { browserName: 'safari' },
+      { browserName: 'android' }
+    ];
+
+    _.each(browsers, function (browser) {
+      self.clients.push(new BrowserStackClient({
+        host: 'localhost',
+        port: 3000,
+        browserName: browser.browserName,
+        browserVersion: browser.browserVersion,
+        timeout: browser.timeout
+      }));
+    });
   }
 
   // Figure out the 'meteor' to run
@@ -433,22 +453,20 @@ _.extend(Sandbox.prototype, {
     var self = this;
     var argsArray = _.compact(_.toArray(arguments).slice(1));
 
-    if (self.clients.length) {
-      console.log("running test with " + self.clients.length + " client(s).");
-    } else {
-      console.log("running a client test with no clients. Use --browserstack" +
-                  " to run against clients." );
-    }
+    console.log("running test with " + self.clients.length + " client(s).");
+
     _.each(self.clients, function (client) {
       console.log("testing with " + client.name + "...");
-      f(new Run(self.execPath, {
+      var run = new Run(self.execPath, {
         sandbox: self,
         args: argsArray,
         cwd: self.cwd,
         env: self._makeEnv(),
         fakeMongo: self.fakeMongo,
         client: client
-      }));
+      });
+      run.baseTimeout = client.timeout;
+      f(run);
     });
   },
 
@@ -560,7 +578,10 @@ _.extend(Sandbox.prototype, {
   // Make a directory in the sandbox. 'filename' is as in write().
   mkdir: function (dirname) {
     var self = this;
-    fs.mkdirSync(path.join(self.cwd, dirname));
+    var dirPath = path.join(self.cwd, dirname);
+    if (! fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath);
+    }
   },
 
   // Rename something in the sandbox. 'oldName' and 'newName' are as in write().
@@ -619,6 +640,8 @@ _.extend(Sandbox.prototype, {
     var packagesDirectoryName = config.getPackagesDirectoryName(serverUrl);
     files.mkdir_p(path.join(self.warehouse, packagesDirectoryName), 0755);
     files.mkdir_p(path.join(self.warehouse, 'package-metadata', 'v1'), 0755);
+    files.mkdir_p(path.join(self.warehouse, 'package-metadata', 'v1.1'), 0755);
+    files.mkdir_p(path.join(self.warehouse, 'package-metadata', 'v2.0.1'), 0755);
 
     var stubCatalog = {
       syncToken: {},
@@ -684,6 +707,7 @@ _.extend(Sandbox.prototype, {
       // Release info
       stubCatalog.collections.releaseVersions.push({
         track: catalog.DEFAULT_TRACK,
+        _id: Math.random().toString(),
         version: releaseName,
         orderKey: releaseName,
         description: "test release " + releaseName,
@@ -707,10 +731,10 @@ _.extend(Sandbox.prototype, {
     var oldOffline = catalog.official.offline;
     catalog.official.offline = true;
     doOrThrow(function () {
-      catalog.official.refresh();
+      catalog.complete.refreshOfficialCatalog();
     });
     _.each(
-      ['autopublish', 'standard-app-packages', 'insecure'],
+      ['autopublish', 'meteor-platform', 'insecure'],
       function (name) {
         var versionRec = doOrThrow(function () {
           return catalog.official.getLatestMainlineVersion(name);
@@ -718,7 +742,7 @@ _.extend(Sandbox.prototype, {
         if (!versionRec) {
           catalog.official.offline = false;
           doOrThrow(function () {
-            catalog.official.refresh();
+            catalog.complete.refreshOfficialCatalog();
           });
           catalog.official.offline = true;
           versionRec = doOrThrow(function () {
@@ -763,9 +787,10 @@ _.extend(Sandbox.prototype, {
     catalog.official.offline = oldOffline;
 
     var dataFile = config.getLocalPackageCacheFilename(serverUrl);
-    fs.writeFileSync(
-      path.join(self.warehouse, 'package-metadata', 'v1', dataFile),
-      JSON.stringify(stubCatalog, null, 2));
+    var tmpCatalog = new catalogRemote.RemoteCatalog();
+    tmpCatalog.initialize({
+      packageStorage: path.join(self.warehouse, 'package-metadata', 'v2.0.1', dataFile)});
+    tmpCatalog.insertData(stubCatalog);
 
     // And a cherry on top
     fs.symlinkSync(path.join(packagesDirectoryName,
@@ -784,7 +809,9 @@ var Client = function (options) {
 
   self.host = options.host;
   self.port = options.port;
-  self.url = "http://" + self.host + ":" + self.port;
+  self.url = "http://" + self.host + ":" + self.port + '/' +
+    (Math.random() * 0x100000000 + 1).toString(36);
+  self.timeout = options.timeout || 40;
 
   if (! self.connect || ! self.stop) {
     console.log("Missing methods in subclass of Client.");
@@ -798,6 +825,8 @@ var PhantomClient = function (options) {
 
   self.name = "phantomjs";
   self.process = null;
+
+  self._logError = true;
 };
 
 util.inherits(PhantomClient, Client);
@@ -812,10 +841,18 @@ _.extend(PhantomClient.prototype, {
       '/bin/bash',
       ['-c',
        ("exec " + phantomPath + " --load-images=no /dev/stdin <<'END'\n" +
-        phantomScript + "END\n")]);
+        phantomScript + "\nEND\n")],
+      {}, function (error, stdout, stderr) {
+        if (self._logError && error) {
+          console.log("PhantomJS exited with error ", error, "\nstdout:\n", stdout, "\nstderr:\n", stderr);
+        }
+      });
   },
+
   stop: function() {
     var self = this;
+    // Suppress the expected SIGTERM exit 'failure'
+    self._logError = false;
     self.process && self.process.kill();
     self.process = null;
   }
@@ -828,9 +865,16 @@ var BrowserStackClient = function (options) {
   var self = this;
   Client.apply(this, arguments);
 
-  self.name = "BrowserStack";
   self.tunnelProcess = null;
   self.driver = null;
+
+  self.browserName = options.browserName;
+  self.browserVersion = options.browserVersion;
+
+  self.name = "BrowserStack - " + self.browserName;
+  if (self.browserVersion) {
+    self.name += " " + self.browserVersion;
+  }
 };
 
 util.inherits(BrowserStackClient, Client);
@@ -847,11 +891,15 @@ _.extend(BrowserStackClient.prototype, {
         "have installed your S3 credentials.");
 
     var capabilities = {
-      'browserName' : 'firefox',
+      'browserName' : self.browserName,
       'browserstack.user' : 'meteor',
       'browserstack.local' : 'true',
       'browserstack.key' : browserStackKey
     };
+
+    if (self.browserVersion) {
+      capabilities.browserVersion = self.browserVersion;
+    }
 
     self._launchBrowserStackTunnel(function (error) {
       if (error)
@@ -1219,7 +1267,7 @@ _.extend(Run.prototype, {
     self._ensureStarted();
 
     // If it's the first time we've called tellMongo on this sandbox,
-    // open a connection to fake-mongod. Wait up to 2 seconds for it
+    // open a connection to fake-mongod. Wait up to 10 seconds for it
     // to accept the connection, retrying every 100ms.
     //
     // XXX we never clean up this connection. Hopefully once
@@ -1231,7 +1279,7 @@ _.extend(Run.prototype, {
       var net = require('net');
 
       var lastStartTime = 0;
-      for (var attempts = 0; ! self.fakeMongoConnection && attempts < 50;
+      for (var attempts = 0; ! self.fakeMongoConnection && attempts < 100;
            attempts ++) {
         // Throttle attempts to one every 100ms
         utils.sleepMs((lastStartTime + 100) - (+ new Date));
@@ -1287,7 +1335,7 @@ var Test = function (options) {
   self.name = options.name;
   self.file = options.file;
   self.fileHash = options.fileHash;
-  self.tags = options.tags || {};
+  self.tags = options.tags || [];
   self.f = options.func;
   self.cleanupHandlers = [];
 };
@@ -1348,10 +1396,8 @@ var define = function (name, tagsList, f) {
     tagsList = [];
   }
 
-  var tags = {};
-  _.each(tagsList, function (tag) {
-    tags[tag] = true;
-  });
+  var tags = tagsList.slice();
+  tags.sort();
 
   allTests.push(new Test({
     name: name,
@@ -1362,101 +1408,256 @@ var define = function (name, tagsList, f) {
   }));
 };
 
-
 ///////////////////////////////////////////////////////////////////////////////
-// Running tests
+// Choosing tests
 ///////////////////////////////////////////////////////////////////////////////
 
 var tagDescriptions = {
   checkout: 'can only run from checkouts',
   net: 'require an internet connection',
-  slow: 'take quite a long time',
-  // these last two are not actually test tags; they reflect the use of
-  // --changed and --tests
+  slow: 'take quite a long time; use --slow to include',
+  // these are pseudo-tags, assigned to tests when you specify
+  // --changed, --file, or a pattern argument
   unchanged: 'unchanged since last pass',
-  'non-matching': "don't match specified pattern"
+  'non-matching': "don't match specified pattern",
+  'in other files': ""
 };
 
-// options: onlyChanged, offline, includeSlowTests, historyLines, testRegexp
-//          clients:
-//             - browserstack (need s3cmd credentials)
-var runTests = function (options) {
-  var failureCount = 0;
+// Returns a TestList object representing a filtered list of tests,
+// according to the options given (which are based closely on the
+// command-line arguments).  Used as the first step of both listTests
+// and runTests.
+//
+// Options: testRegexp, fileRegexp, onlyChanged, offline, includeSlowTests
+var getFilteredTests = function (options) {
+  options = options || {};
 
-  var tests = getAllTests();
+  var allTests = getAllTests();
 
-  if (! tests.length) {
-    process.stderr.write("No tests defined.\n");
-    return 0;
+  if (allTests.length) {
+    var testState = readTestState();
+
+    // Add pseudo-tags 'non-matching', 'unchanged', and 'in other files'
+    // (but only so that we can then skip tests with those tags)
+    allTests = allTests.map(function (test) {
+      var newTags = [];
+
+      if (options.fileRegexp && ! options.fileRegexp.test(test.file)) {
+        newTags.push('in other files');
+      } else if (options.testRegexp && ! options.testRegexp.test(test.name)) {
+        newTags.push('non-matching');
+      } else if (options.onlyChanged &&
+                 test.fileHash === testState.lastPassedHashes[test.file]) {
+        newTags.push('unchanged');
+      }
+
+      if (! newTags.length) {
+        return test;
+      }
+
+      return _.extend({}, test, { tags: test.tags.concat(newTags) });
+    });
   }
 
-  var testStateFile = path.join(process.env.HOME, '.meteortest');
+  // (order of tags is significant to the "skip counts" that are displayed)
+  var tagsToSkip = [];
+  if (options.fileRegexp) {
+    tagsToSkip.push('in other files');
+  }
+  if (options.testRegexp) {
+    tagsToSkip.push('non-matching');
+  }
+  if (options.onlyChanged) {
+    tagsToSkip.push('unchanged');
+  }
+  if (! files.inCheckout()) {
+    tagsToSkip.push('checkout');
+  }
+  if (options.offline) {
+    tagsToSkip.push('net');
+  }
+  if (! options.includeSlowTests) {
+    tagsToSkip.push('slow');
+  }
+
+  return new TestList(allTests, tagsToSkip, testState);
+};
+
+// A TestList is the result of getFilteredTests.  It holds the original
+// list of all tests, the filtered list, and stats on how many tests
+// were skipped (see generateSkipReport).
+//
+// TestList also has code to save the hashes of files where all tests
+// ran and passed (for the `--changed` option).  If a testState is
+// provided, the notifyFailed and saveTestState can be used to modify
+// the testState appropriately and write it out.
+var TestList = function (allTests, tagsToSkip, testState) {
+  tagsToSkip = (tagsToSkip || []);
+  testState = (testState || null); // optional
+
+  var self = this;
+  self.allTests = allTests;
+  self.skippedTags = tagsToSkip;
+  self.skipCounts = {};
+  self.testState = testState;
+
+  _.each(tagsToSkip, function (tag) {
+    self.skipCounts[tag] = 0;
+  });
+
+  self.fileInfo = {}; // path -> {hash, hasSkips, hasFailures}
+
+  self.filteredTests = _.filter(allTests, function (test) {
+
+    if (! self.fileInfo[test.file]) {
+      self.fileInfo[test.file] = {
+        hash: test.fileHash,
+        hasSkips: false,
+        hasFailures: false
+      };
+    }
+    var fileInfo = self.fileInfo[test.file];
+
+    // We look for tagsToSkip *in order*, and when we decide to
+    // skip a test, we don't keep looking at more tags, and we don't
+    // add the test to any further "skip counts".
+    return !_.any(tagsToSkip, function (tag) {
+      if (_.contains(test.tags, tag)) {
+        self.skipCounts[tag]++;
+        fileInfo.hasSkips = true;
+        return true;
+      } else {
+        return false;
+      }
+    });
+  });
+};
+
+// Mark a test's file as having failures.  This prevents
+// saveTestState from saving its hash as a potentially
+// "unchanged" file to be skipped in a future run.
+TestList.prototype.notifyFailed = function (test) {
+  this.fileInfo[test.file].hasFailures = true;
+};
+
+// If this TestList was constructed with a testState,
+// modify it and write it out based on which tests
+// were skipped and which tests had failures.
+TestList.prototype.saveTestState = function () {
+  var self = this;
+  var testState = self.testState;
+  if (! (testState && self.filteredTests.length)) {
+    return;
+  }
+
+  _.each(self.fileInfo, function (info, f) {
+    if (info.hasFailures) {
+      delete testState.lastPassedHashes[f];
+    } else if (! info.hasSkips) {
+      testState.lastPassedHashes[f] = info.hash;
+    }
+  });
+
+  writeTestState(testState);
+};
+
+// Return a string like "Skipped 1 foo test\nSkipped 5 bar tests\n"
+TestList.prototype.generateSkipReport = function () {
+  var self = this;
+  var result = '';
+
+  _.each(self.skippedTags, function (tag) {
+    var count = self.skipCounts[tag];
+    if (count) {
+      var noun = "test" + (count > 1 ? "s" : ""); // "test" or "tests"
+      // "non-matching tests" or "tests in other files"
+      var nounPhrase = (/ /.test(tag) ?
+                        (noun + " " + tag) : (tag + " " + noun));
+      // " (foo)" or ""
+      var parenthetical = (tagDescriptions[tag] ? " (" +
+                           tagDescriptions[tag] + ")" : '');
+      result += ("Skipped " + count + " " + nounPhrase + parenthetical + '\n');
+    }
+  });
+
+  return result;
+};
+
+var getTestStateFilePath = function () {
+  return path.join(process.env.HOME, '.meteortest');
+};
+
+var readTestState = function () {
+  var testStateFile = getTestStateFilePath();
   var testState;
   if (fs.existsSync(testStateFile))
     testState = JSON.parse(fs.readFileSync(testStateFile, 'utf8'));
   if (! testState || testState.version !== 1)
     testState = { version: 1, lastPassedHashes: {} };
-  var currentHashes = {};
+  return testState;
+};
 
-  // _.keys(skipCounts) is the set of tags to skip
-  var skipCounts = {};
-  if (! files.inCheckout())
-    skipCounts['checkout'] = 0;
+var writeTestState = function (testState) {
+  var testStateFile = getTestStateFilePath();
+  fs.writeFileSync(testStateFile, JSON.stringify(testState), 'utf8');
+};
 
-  if (options.offline)
-    skipCounts['net'] = 0;
+// Same options as getFilteredTests.  Writes to stdout and stderr.
+var listTests = function (options) {
+  var testList = getFilteredTests(options);
 
-  if (! options.includeSlowTests)
-    skipCounts['slow'] = 0;
-
-  if (options.testRegexp) {
-    var lengthBeforeTestRegexp = tests.length;
-    // Filter out tests whose name doesn't match.
-    tests = _.filter(tests, function (test) {
-      return options.testRegexp.test(test.name);
-    });
-    skipCounts['non-matching'] = lengthBeforeTestRegexp - tests.length;
+  if (! testList.allTests.length) {
+    Console.stderr.write("No tests defined.\n");
+    return;
   }
 
-  if (options.onlyChanged) {
-    var lengthBeforeOnlyChanged = tests.length;
-    // Filter out tests that haven't changed since they last passed.
-    tests = _.filter(tests, function (test) {
-      return test.fileHash !== testState.lastPassedHashes[test.file];
+  _.each(_.groupBy(testList.filteredTests, 'file'), function (tests, file) {
+    Console.stdout.write(file + ':\n');
+    _.each(tests, function (test) {
+      Console.stdout.write('  - ' + test.name +
+                           (test.tags.length ? ' [' + test.tags.join(' ') + ']'
+                            : ''));
     });
-    skipCounts.unchanged = lengthBeforeOnlyChanged - tests.length;
+  });
+
+  Console.stderr.write('\n');
+  Console.stderr.write(testList.filteredTests.length + " tests listed.");
+  Console.stderr.write(testList.generateSkipReport());
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Running tests
+///////////////////////////////////////////////////////////////////////////////
+
+// options: onlyChanged, offline, includeSlowTests, historyLines, testRegexp,
+//          fileRegexp,
+//          clients:
+//             - browserstack (need s3cmd credentials)
+var runTests = function (options) {
+  var testList = getFilteredTests(options);
+
+  if (! testList.allTests.length) {
+    Console.stderr.write("No tests defined.\n");
+    return 0;
   }
 
-  var failuresInFile = {};
-  var skipsInFile = {};
   var totalRun = 0;
-  _.each(tests, function (test) {
-    currentHashes[test.file] = test.fileHash;
-    // Is this a test we're supposed to skip?
-    var shouldSkip = false;
-    _.each(_.keys(test.tags), function (tag) {
-      if (_.has(skipCounts, tag)) {
-        shouldSkip = true;
-        skipCounts[tag] ++;
-      }
-    });
-    if (shouldSkip) {
-      skipsInFile[test.file] = true;
-      return;
-    }
+  var failedTests = [];
 
+  _.each(testList.filteredTests, function (test) {
     totalRun++;
-    process.stderr.write(test.name + "... ");
+    process.stderr.write(test.file + ": " + test.name + " ... ");
 
     var failure = null;
     try {
       runningTest = test;
+      var startTime = +(new Date);
       test.f(options);
     } catch (e) {
       if (e instanceof TestFailure) {
         failure = e;
       } else {
-        process.stderr.write("exception\n\n");
+        Console.stderr.write("exception\n\n");
         throw e;
       }
     } finally {
@@ -1465,12 +1666,14 @@ var runTests = function (options) {
     }
 
     if (failure) {
-      process.stderr.write("fail!\n");
-      failureCount++;
+      Console.stderr.write("fail!\n");
+      failedTests.push(test);
+      testList.notifyFailed(test);
+
       var frames = parseStack.parse(failure);
       var relpath = path.relative(files.getCurrentToolsDir(),
                                   frames[0].file);
-      process.stderr.write("  => " + failure.reason + " at " +
+      Console.stderr.write("  => " + failure.reason + " at " +
                            relpath + ":" + frames[0].line + "\n");
       if (failure.reason === 'no-match') {
       }
@@ -1479,28 +1682,28 @@ var runTests = function (options) {
           return status.signal || ('' + status.code) || "???";
         };
 
-        process.stderr.write("  => Expected: " + s(failure.details.expected) +
+        Console.stderr.write("  => Expected: " + s(failure.details.expected) +
                              "; actual: " + s(failure.details.actual) + "\n");
       }
       if (failure.reason === 'expected-exception') {
       }
       if (failure.reason === 'not-equal') {
-        process.stderr.write(
-"  => Expected: " + JSON.stringify(failure.details.expected) +
-"; actual: " + JSON.stringify(failure.details.actual) + "\n");
+        Console.stderr.write(
+          "  => Expected: " + JSON.stringify(failure.details.expected) +
+            "; actual: " + JSON.stringify(failure.details.actual) + "\n");
       }
 
       if (failure.details.run) {
         failure.details.run.outputLog.end();
         var lines = failure.details.run.outputLog.get();
         if (! lines.length) {
-          process.stderr.write("  => No output\n");
+          Console.stderr.write("  => No output\n");
         } else {
           var historyLines = options.historyLines || 100;
 
-          process.stderr.write("  => Last " + historyLines + " lines:\n");
+          Console.stderr.write("  => Last " + historyLines + " lines:\n");
           _.each(lines.slice(-historyLines), function (line) {
-            process.stderr.write("  " +
+            Console.stderr.write("  " +
                                  (line.channel === "stderr" ? "2| " : "1| ") +
                                  line.text +
                                  (line.bare ? "%" : "") + "\n");
@@ -1509,51 +1712,38 @@ var runTests = function (options) {
       }
 
       if (failure.details.messages) {
-        process.stderr.write("  => Errors while building:\n");
-        process.stderr.write(failure.details.messages.formatMessages());
+        Console.stderr.write("  => Errors while building:\n");
+        Console.stderr.write(failure.details.messages.formatMessages());
       }
-
-      failuresInFile[test.file] = true;
     } else {
-      process.stderr.write("ok\n");
+      var durationMs = +(new Date) - startTime;
+      Console.stderr.write("ok (" + durationMs + " ms)\n");
     }
   });
 
-  _.each(_.keys(currentHashes), function (f) {
-    if (failuresInFile[f])
-      delete testState.lastPassedHashes[f];
-    else if (! skipsInFile[f])
-      testState.lastPassedHashes[f] = currentHashes[f];
-  });
-
-  if (tests.length)
-    fs.writeFileSync(testStateFile, JSON.stringify(testState), 'utf8');
+  testList.saveTestState();
 
   if (totalRun > 0)
-    process.stderr.write("\n");
+    Console.stderr.write("\n");
 
-  var totalSkipCount = 0;
-  _.each(skipCounts, function (count, tag) {
-    totalSkipCount += count;
-    if (count) {
-      process.stderr.write("Skipped " + count + " " + tag + " test" +
-                           (count > 1 ? "s" : "") + " (" +
-                           tagDescriptions[tag] + ")\n");
-    }
-  });
+  Console.stderr.write(testList.generateSkipReport());
 
-  if (tests.length === 0) {
-    process.stderr.write("No tests run.\n");
+  if (testList.filteredTests.length === 0) {
+    Console.stderr.write("No tests run.\n");
     return 0;
-  } else if (failureCount === 0) {
+  } else if (failedTests.length === 0) {
     var disclaimers = '';
-    if (totalSkipCount > 0)
+    if (testList.filteredTests.length < testList.allTests.length)
       disclaimers += " other";
-    process.stderr.write("All" + disclaimers + " tests passed.\n");
+    Console.stderr.write("All" + disclaimers + " tests passed.\n");
     return 0;
   } else {
-    process.stderr.write(failureCount + " failure" +
-                         (failureCount > 1 ? "s" : "") + ".\n");
+    var failureCount = failedTests.length;
+    Console.stderr.write(failureCount + " failure" +
+                         (failureCount > 1 ? "s" : "") + ":\n");
+    _.each(failedTests, function (test) {
+      Console.stderr.write("  - " + test.file + ": " + test.name);
+    });
     return 1;
   }
 };
@@ -1591,6 +1781,7 @@ var runTests = function (options) {
 
 _.extend(exports, {
   runTests: runTests,
+  listTests: listTests,
   markStack: markStack,
   define: define,
   Sandbox: Sandbox,

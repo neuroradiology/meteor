@@ -113,7 +113,7 @@ exports.createAndDeployApp = function (sandbox, options) {
   }
   var run = sandbox.run.apply(sandbox, runArgs);
   run.waitSecs(90);
-  run.match('Now serving at ' + name);
+  run.match('Now serving at http://' + name);
   run.waitSecs(10);
   run.expectExit(0);
   return name;
@@ -190,12 +190,12 @@ exports.deployWithNewEmail = function (s, email, appName) {
 
 var getLoadedPackages = function () {
   return uniload.load({
-    packages: ['livedata']
+    packages: ['meteor', 'ddp']
   });
 };
 
 var ddpConnect = function (url) {
-  var DDP = getLoadedPackages().livedata.DDP;
+  var DDP = getLoadedPackages().ddp.DDP;
   return DDP.connect(url);
 };
 

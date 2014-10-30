@@ -50,6 +50,10 @@ var doOrThrow = function (f) {
 };
 
 var runTest = function () {
+   // As preparation, let's initialize the official catalog. It servers as our
+   // data store, so we will probably need it.
+   catalog.official.initialize();
+
   var readManifest = function (tmpOutputDir) {
     return JSON.parse(fs.readFileSync(
       path.join(tmpOutputDir, "programs", "web.browser", "program.json"),
@@ -83,7 +87,7 @@ var runTest = function () {
                                     "programs", "server", "node_modules")));
     // yes package node_modules directory
     assert(fs.lstatSync(path.join(
-      tmpOutputDir, "programs", "server", "npm", "livedata"))
+      tmpOutputDir, "programs", "server", "npm", "ddp"))
            .isDirectory());
 
     // verify that contents are minified
@@ -113,7 +117,7 @@ var runTest = function () {
     // verify that contents are not minified
     var manifest = readManifest(tmpOutputDir);
     var foundMeteor = false;
-    var foundDeps = false;
+    var foundTracker = false;
     _.each(manifest, function (item) {
       if (item.type !== 'js')
         return;
@@ -123,11 +127,11 @@ var runTest = function () {
       assert(!/:tests/.test(item.path));
       if (item.path === 'packages/meteor.js')
         foundMeteor = true;
-      if (item.path === 'packages/deps.js')
-        foundDeps = true;
+      if (item.path === 'packages/tracker.js')
+        foundTracker = true;
     });
     assert(foundMeteor);
-    assert(foundDeps);
+    assert(foundTracker);
   });
 
   console.log("includeNodeModulesSymlink");
@@ -150,7 +154,7 @@ var runTest = function () {
     // package node_modules directory also a symlink
     // XXX might be breaking this
     assert(fs.lstatSync(path.join(
-      tmpOutputDir, "programs", "server", "npm", "livedata", "node_modules"))
+      tmpOutputDir, "programs", "server", "npm", "ddp", "node_modules"))
            .isSymbolicLink());
   });
 };
@@ -158,9 +162,7 @@ var runTest = function () {
 
 var Fiber = require('fibers');
 Fiber(function () {
-  doOrThrow(function () {
-    release._setCurrentForOldTest();
-  });
+  release._setCurrentForOldTest();
 
   try {
     runTest();

@@ -2,8 +2,10 @@ var crypto = Npm.require('crypto');
 var fs = Npm.require('fs');
 var path = Npm.require('path');
 
+var _disableSizeCheck = false;
+
 Meteor.AppCache = {
-  config: function(options) {
+  config: function (options) {
     _.each(options, function (value, option) {
       if (option === 'browsers') {
         disabledBrowsers = {};
@@ -15,6 +17,10 @@ Meteor.AppCache = {
         _.each(value, function (urlPrefix) {
           RoutePolicy.declare(urlPrefix, 'static-online');
         });
+      }
+      // option to suppress warnings for tests.
+      else if (option === '_disableSizeCheck') {
+        _disableSizeCheck = value;
       }
       else if (value === false) {
         disabledBrowsers[option] = true;
@@ -29,7 +35,7 @@ Meteor.AppCache = {
 };
 
 var disabledBrowsers = {};
-var browserDisabled = function(request) {
+var browserDisabled = function (request) {
   return disabledBrowsers[request.browser.name];
 };
 
@@ -40,7 +46,7 @@ WebApp.addHtmlAttributeHook(function (request) {
     return { manifest: "/app.manifest" };
 });
 
-WebApp.connectHandlers.use(function(req, res, next) {
+WebApp.connectHandlers.use(function (req, res, next) {
   if (req.url !== '/app.manifest') {
     return next();
   }
@@ -71,7 +77,7 @@ WebApp.connectHandlers.use(function(req, res, next) {
   // So to ensure that the client updates if client resources change,
   // include a hash of client resources in the manifest.
 
-  manifest += "# " + WebApp.clientHash + "\n";
+  manifest += "# " + WebApp.clientHash() + "\n";
 
   // When using the autoupdate package, also include
   // AUTOUPDATE_VERSION.  Otherwise the client will get into an
@@ -81,7 +87,7 @@ WebApp.connectHandlers.use(function(req, res, next) {
 
   if (Package.autoupdate) {
     var version = Package.autoupdate.Autoupdate.autoupdateVersion;
-    if (version !== WebApp.clientHash)
+    if (version !== WebApp.clientHash())
       manifest += "# " + version + "\n";
   }
 
@@ -89,7 +95,7 @@ WebApp.connectHandlers.use(function(req, res, next) {
 
   manifest += "CACHE:" + "\n";
   manifest += "/" + "\n";
-  _.each(WebApp.clientProgram.manifest, function (resource) {
+  _.each(WebApp.clientPrograms[WebApp.defaultArch].manifest, function (resource) {
     if (resource.where === 'client' &&
         ! RoutePolicy.classify(resource.url)) {
       manifest += resource.url;
@@ -118,7 +124,7 @@ WebApp.connectHandlers.use(function(req, res, next) {
   // request to the server and have the asset served from cache by
   // specifying the full URL with hash in their code (manually, with
   // some sort of URL rewriting helper)
-  _.each(WebApp.clientProgram.manifest, function (resource) {
+  _.each(WebApp.clientPrograms[WebApp.defaultArch].manifest, function (resource) {
     if (resource.where === 'client' &&
         ! RoutePolicy.classify(resource.url) &&
         !resource.cacheable) {
@@ -152,9 +158,9 @@ WebApp.connectHandlers.use(function(req, res, next) {
   return res.end(body);
 });
 
-var sizeCheck = function() {
+var sizeCheck = function () {
   var totalSize = 0;
-  _.each(WebApp.clientProgram.manifest, function (resource) {
+  _.each(WebApp.clientPrograms[WebApp.defaultArch].manifest, function (resource) {
     if (resource.where === 'client' &&
         ! RoutePolicy.classify(resource.url)) {
       totalSize += resource.size;
@@ -173,4 +179,12 @@ var sizeCheck = function() {
   }
 };
 
-sizeCheck();
+// Run the size check after user code has had a chance to run. That way,
+// the size check can take into account files that the user does not
+// want cached. Otherwise, the size check warning will still print even
+// if the user excludes their large files with
+// `Meteor.AppCache.config({onlineOnly: files})`.
+Meteor.startup(function () {
+  if (! _disableSizeCheck)
+    sizeCheck();
+});

@@ -11,8 +11,22 @@ var catalog = require('./catalog.js');
 var buildmessage = require('./buildmessage.js');
 var packageLoader = require('./package-loader.js');
 var PackageSource = require('./package-source.js');
+var packageVersionParser = require('./package-version-parser.js');
+var Console = require('./console.js').Console;
 
 var project = exports;
+
+// Given a set of lines, each of the form "foo@bar", return an object of form
+// {foo: "bar", bar: null}. If there is "bar", value of the corresponding key is
+// null.
+// Trims whitespace & other filler characters of a line in a project file.
+var trimLine = function (line) {
+  var match = line.match(/^([^#]*)#/);
+  if (match)
+    line = match[1];
+  line = line.replace(/^\s+|\s+$/g, ''); // leading/trailing whitespace
+  return line;
+};
 
 // Given a set of lines, each of the form "foo@bar", return an array of form
 // [{packageName: foo, versionConstraint: bar}]. If there is bar,
@@ -58,6 +72,15 @@ var Project = function () {
   // and recorded in the .meteor/versions file.
   self.dependencies = null;
 
+  // Plugins & versions of all Cordova plugins dependencies.
+  // A mapping from the Cordova plugin identifier to a semver string or a
+  // tarball url with sha.
+  // XXX Ignores the transitive dependencies.
+  self.cordovaPlugins = null;
+
+  // Platforms for this project.
+  self.platforms = null;
+
   // The package loader for this project, with the project's dependencies as its
   // version file. (See package-loader.js for more information about package
   // loaders). Derived from self.dependencies.
@@ -83,9 +106,19 @@ var Project = function () {
   // to tell the user that we are adding packages to an app during
   // test-packages.  (We still print other messages like packages downloading.)
   self.muted = false;
+
+  // If we are building this app in debug mode -- either because we are bundling
+  // for debug, or because we are running in terminal without the production
+  // flag, then we should include debug packages and build everything that we
+  // build as part of the app with debug build. Otherwise, don't.
+  self.includeDebug = true;
 };
 
 _.extend(Project.prototype, {
+  setDebug: function (debug) {
+    var self = this;
+    self.includeDebug = debug;
+  },
 
   // Sets the mute flag on the project. Muted projects don't print out non-error
   // output.
@@ -122,6 +155,11 @@ _.extend(Project.prototype, {
     // Also, make sure we have an app identifier for this app.
     self.ensureAppIdentifier();
 
+    self.cordovaPlugins = processPerConstraintLines(
+      files.getLinesOrEmpty(self._getCordovaPluginsFile()));
+
+    self.ensurePlatforms();
+
     // Lastly, invalidate everything that we have computed -- obviously the
     // dependencies that we counted with the previous rootPath are wrong and we
     // need to recompute them.
@@ -132,7 +170,9 @@ _.extend(Project.prototype, {
     self.viableDepSource = true;
   },
 
-  // Rereads all the on-disk files by reinitalizing the project with the same directory.
+  // Rereads all the on-disk files by reinitalizing the project with the same
+  // directory.  Caches the old versions, in case we were running with --release
+  // (and they don't match the ones on disk).
   //
   // We don't automatically reinitialize this singleton when an app is
   // restarted, but an app restart is very likely caused by changes to our
@@ -140,7 +180,9 @@ _.extend(Project.prototype, {
   // dependencies here.
   reload : function () {
     var self = this;
+    var oldDependencies = self.dependencies;
     self.setRootDir(self.rootDir);
+    self.dependencies = oldDependencies;
   },
 
   // Several fields in project are derived from constraints. Whenever we change
@@ -150,8 +192,9 @@ _.extend(Project.prototype, {
   // If the project's dependencies are up to date, this does nothing. Otherwise,
   // it recomputes the combined constraints, the versions to use and initializes
   // the package loader for this project. This WILL REWRITE THE VERSIONS FILE.
-  _ensureDepsUpToDate : function () {
+  _ensureDepsUpToDate : function (options) {
     var self = this;
+    options = options || {};
     buildmessage.assertInCapture();
 
     // To calculate project dependencies, we need to know what release we are
@@ -164,9 +207,9 @@ _.extend(Project.prototype, {
 
     if (!self._depsUpToDate) {
 
-      // We are calculating this project's dependencies, so we obviously should not
-      // use it as a source of version locks (unless specified explicitly through
-      // previousVersions).
+      // We are calculating this project's dependencies, so we obviously should
+      // not use it as a source of version locks (unless specified explicitly
+      // through previousVersions).
       self.viableDepSource = false;
 
       // Use current release to calculate packages & combined constraints.
@@ -187,23 +230,24 @@ _.extend(Project.prototype, {
       } catch (err) {
         // XXX This error handling is bogus. Use buildmessage instead, or
         // something. See also compiler.determineBuildTimeDependencies
-        process.stdout.write(
+        Console.warn(
           "Could not resolve the specified constraints for this project:\n"
-           + (err.constraintSolverError ? err : err.stack) + "\n");
+           + (err.constraintSolverError ? err : err.stack));
         process.exit(1);
       }
 
       // Download packages to disk, and rewrite .meteor/versions if it has
       // changed.
       var oldVersions = self.dependencies;
-      var setV = self.setVersions(newVersions);
+      var setV = self.setVersions(newVersions,
+                                  {alwaysRecord: options.alwaysRecord});
       self.showPackageChanges(oldVersions, newVersions, {
         onDiskPackages: setV.downloaded
       });
 
       if (!setV.success) {
-        process.stdout.write(
-          "Could not install all the requested packages.\n");
+        Console.warn(
+          "Could not install all the requested packages.");
         process.exit(1);
       }
 
@@ -236,10 +280,14 @@ _.extend(Project.prototype, {
     // self.constraints variable is always up to date.
     // Note that two parts of the "add" command run code that matches this.
     _.each(self.constraints, function (constraint, packageName) {
-      allDeps.push(_.extend({packageName: packageName},
-                            utils.parseVersionConstraint(constraint)));
+      var oldConstraint = "";
+      if (constraint) {
+        oldConstraint = "@" + constraint;
+      }
+      allDeps.push(
+        _.extend({name: packageName},
+                 utils.parseConstraint(packageName + oldConstraint)));
     });
-
 
     // Now we have to go through the programs directory, go through each of the
     // programs, get their dependencies and use them. (We could have memorized
@@ -251,29 +299,30 @@ _.extend(Project.prototype, {
 
       var programSubdir = path.join(self.getProgramsDirectory(), item);
       buildmessage.enterJob({
-        title: "initializing program `" + programName + "`",
+        title: "Initializing program `" + programName + "`",
         rootPath: self.rootDir
       }, function () {
         var packageSource;
-        // For now, if it turns into a unipackage, it should have a version.
+        // For now, if it turns into a isopack, it should have a version.
         var programSource = new PackageSource(catalog.complete);
         programSource.initFromPackageDir(programSubdir);
         _.each(programSource.architectures, function (sourceUnibuild) {
           _.each(sourceUnibuild.uses, function (use) {
-            var constraint = use.constraint || null;
-            allDeps.push(_.extend({packageName: use.package},
-                                  utils.parseVersionConstraint(constraint)));
+            var oldConstraint = "";
+            if (use.constraint) {
+              oldConstraint = "@" + use.constraint;
+            }
+            allDeps.push(utils.parseConstraint(use.package + oldConstraint));
+
           });
         });
       });
-
     });
-
     // Finally, each release package is a weak exact constraint. So, let's add
     // those.
     _.each(releasePackages, function(version, name) {
-      allDeps.push({packageName: name, version: version, weak: true,
-                    type: 'exactly'});
+     allDeps.push(_.extend(utils.parseConstraint(name + "@=" + version),
+                           { weak: true }));
     });
 
     // This is an UGLY HACK that has to do with our requirement to have a
@@ -282,7 +331,7 @@ _.extend(Project.prototype, {
     // someday, this will make sense.  (The conditional here allows us to work
     // in tests with releases that have no packages.)
     if (catalog.complete.getPackage("ctl")) {
-      allDeps.push({packageName: "ctl", version: null, type: 'any-reasonable'});
+      allDeps.push(utils.parseConstraint("ctl"));
     }
 
     return allDeps;
@@ -300,11 +349,11 @@ _.extend(Project.prototype, {
     // written to disk.
     var messageLog = [];
     var failed = false;
-
+    var stdSpace = "   ";
     // Remove the versions that don't exist
     var removed = _.difference(_.keys(versions), _.keys(newVersions));
     _.each(removed, function(packageName) {
-      messageLog.push("  removed " + packageName + " from project");
+      messageLog.push(stdSpace + "removed " + packageName + " from project");
     });
 
     _.each(newVersions, function(version, packageName) {
@@ -322,9 +371,9 @@ _.extend(Project.prototype, {
            options.onDiskPackages[packageName] !== version)) {
         // XXX maybe we shouldn't be letting the constraint solver choose
         // things that don't have the right arches?
-        process.stderr.write("Package " + packageName +
+        Console.warn("Package " + packageName +
                              " has no compatible build for version " +
-                             version + "\n");
+                             version);
         failed = true;
         return;
       }
@@ -332,11 +381,18 @@ _.extend(Project.prototype, {
       // If the previous versions file had this, then we are upgrading, if it did
       // not, then we must be adding this package anew.
       if (_.has(versions, packageName)) {
-        messageLog.push("  upgraded " + packageName + " from version " +
-                        versions[packageName] +
-                        " to version " + newVersions[packageName]);
+        if (packageVersionParser.lessThan(
+          newVersions[packageName], versions[packageName])) {
+          messageLog.push(stdSpace + "downgraded " + packageName + " from version " +
+                          versions[packageName] +
+                          " to version " + newVersions[packageName]);
+        } else {
+          messageLog.push(stdSpace + "upgraded " + packageName + " from version " +
+                          versions[packageName] +
+                          " to version " + newVersions[packageName]);
+        }
       } else {
-        messageLog.push("  added " + packageName +
+        messageLog.push(stdSpace + "added " + packageName +
                         " at version " + newVersions[packageName]);
       };
     });
@@ -345,10 +401,64 @@ _.extend(Project.prototype, {
       return 1;
 
     // Show the user the messageLog of packages we added.
-    if (!self.muted && !_.isEmpty(versions)) {
+    if ((!self.muted && !_.isEmpty(versions))
+        || options.alwaysShow) {
       _.each(messageLog, function (msg) {
-        process.stdout.write(msg + "\n");
+        Console.info(msg);
       });
+
+      // Pay special attention to non-backwards-compatible changes.
+      var incompatibleUpdates = [];
+      _.each(self.constraints, function (constraint, package) {
+        var oldV = versions[package];
+        var newV = newVersions[package];
+        // Did we not actually have a version before? We don't care.
+        if (!oldV) {
+          return;
+        }
+        // If this is a local package, then we are aware that this happened and it
+        // is not news.
+        if (catalog.complete.isLocalPackage(package)) {
+          return;
+        }
+        // If we can't find the old version, then maybe that was a local package and
+        // now is not, and that is also not news.
+        var oldVersion;
+        var newRec;
+        var messages = buildmessage.capture(function () {
+          oldVersion = catalog.complete.getVersion(package, oldV);
+          newRec =
+            catalog.complete.getVersion(package, newV);
+        });
+        if (messages.hasMessages()) {
+          // It would be very weird for us to end up here! But it is
+          // theoretically possible. If it happens, we should probably not crash
+          // (since we have already done all the operations) and logging a
+          // confusing message will just be confusing, so ... recover by
+          // skipping, I guess.
+          return;
+        };
+
+        // The new version has to exist, or we wouldn't have chosen it.
+        if (!oldVersion) {
+          return;
+        }
+        var oldECV = oldVersion.earliestCompatibleVersion;
+        if (oldECV !== newRec.earliestCompatibleVersion) {
+          incompatibleUpdates.push({
+            name: package,
+            description: "(" + oldV + "->" + newV + ") " + newRec.description
+          });
+        }
+      });
+
+      if (!_.isEmpty(incompatibleUpdates)) {
+        Console.warn(
+          "\nThe following packages have been updated to new versions that are not " +
+            "backwards compatible:");
+        utils.printPackageList(incompatibleUpdates, { level: Console.LEVEL_WARN });
+        Console.warn("\n");
+      };
     }
     return 0;
   },
@@ -446,6 +556,70 @@ _.extend(Project.prototype, {
     return path.join(self.rootDir, '.meteor', 'versions');
   },
 
+  getCordovaPlugins: function () {
+    var self = this;
+    return _.clone(self.cordovaPlugins);
+  },
+
+  getPlatforms: function () {
+    var self = this;
+    return _.clone(self.platforms);
+  },
+
+  getDefaultPlatforms: function () {
+    // these platforms are always present and can be neither added or removed
+    var defaultPlatforms = ["server", "browser"];
+
+    return defaultPlatforms;
+  },
+
+  getCordovaPlatforms: function () {
+    var self = this;
+    return _.difference(self.getPlatforms(), self.getDefaultPlatforms());
+  },
+
+  // Returns the set of web archs that are targeted by the project
+  getWebArchs: function () {
+    var self = this;
+    var archs = [ "web.browser" ];
+    if (! _.isEmpty(self.getCordovaPlatforms())) {
+      archs.push("web.cordova");
+    }
+    return archs;
+  },
+
+  // Returns the file path to the .meteor/cordova-plugins file, containing the
+  // Cordova plugins dependencies for this specific project.
+  _getCordovaPluginsFile: function () {
+    var self = this;
+    return path.join(self.rootDir, '.meteor', 'cordova-plugins');
+  },
+
+  // Returns the file path to the .meteor/platforms file, containing the
+  // platforms for this specific project.
+  _getPlatformsFile: function () {
+    var self = this;
+    return path.join(self.rootDir, '.meteor', 'platforms');
+  },
+
+  ensurePlatforms: function () {
+    var self = this;
+
+    var lines = files.getLinesOrEmpty(self._getPlatformsFile());
+    self.platforms = _.compact(_.map(lines, files.trimLine));
+
+    if (! self.platforms) {
+      self.platforms = self.getDefaultPlatforms();
+      self.writePlatformsFile();
+    }
+  },
+
+  writePlatformsFile: function () {
+    var self = this;
+    fs.writeFileSync(self._getPlatformsFile(),
+      self.platforms.join("\n") + "\n", 'utf8');
+  },
+
   // Give the package loader attached to this project to the caller.
   //
   // Returns a packageLoader that has been pre-loaded with this project's
@@ -484,6 +658,17 @@ _.extend(Project.prototype, {
     if (!lines.length)
       return '';
     return files.trimLine(lines[0]);
+  },
+
+  // Like getMeteorReleaseVersion, but adds METEOR@ to the beginning if it's
+  // missing.
+  getNormalizedMeteorReleaseVersion: function () {
+    var self = this;
+    var raw = self.getMeteorReleaseVersion();
+    if (raw === null)
+      return null;
+    var parts = utils.splitReleaseName(raw);
+    return parts[0] + '@' + parts[1];
   },
 
   // Returns the full filepath of the projects .meteor/release file.
@@ -589,7 +774,6 @@ _.extend(Project.prototype, {
   setVersions: function (newVersions, options) {
     var self = this;
     options = options || {};
-    buildmessage.assertInCapture();
 
     var downloaded = tropohouse.default.downloadMissingPackages(newVersions);
     var ret = {
@@ -622,7 +806,8 @@ _.extend(Project.prototype, {
     options = options || {};
 
     // If the user forced us to an explicit release, then maybe we shouldn't
-    // record versions, unless we are updating, in which case, we should.
+    // record versions, unless we are updating or creating, in which case, we
+    // should.
     if (release.explicit && !options.alwaysRecord) {
       return;
     }
@@ -653,7 +838,6 @@ _.extend(Project.prototype, {
   // disk and the operation has failed.
   addPackages : function (moreDeps, newVersions) {
     var self = this;
-    buildmessage.assertInCapture();
 
     // First, we need to make sure that we have downloaded all the packages that
     // we are going to use. So, go through the versions and call tropohouse to
@@ -791,6 +975,66 @@ _.extend(Project.prototype, {
     appendText += upgrader + '\n';
 
     fs.appendFileSync(self._finishedUpgradersFile(), appendText);
+  },
+
+  // Adds the passed plugins to the cordovaPlugins list. If the plugin was
+  // already in the list, just updates it in-place.
+  // newPlugins is an object with a mapping from the Cordova plugin identifier
+  // to an semver string or a tarball url with a sha.
+  addCordovaPlugins: function (newPlugins) {
+    var self = this;
+    self.cordovaPlugins = _.extend(self.cordovaPlugins, newPlugins);
+
+    var plugins = self._getCordovaPluginsFile();
+    var lines = [];
+    _.each(self.cordovaPlugins, function (versionString, plugin) {
+      if (versionString)
+        lines.push(plugin + '@' + versionString);
+      else
+        lines.push(plugin);
+    });
+    lines.push('\n');
+    fs.writeFileSync(plugins, lines.join('\n'), 'utf8');
+  },
+
+  // Removes the plugins from the cordova-plugins file if they existed.
+  // pluginsToRemove - array of Cordova plugin identifiers
+  //
+  // Returns an array of plugin identifiers that were actually removed.
+  removeCordovaPlugins: function (pluginsToRemove) {
+    var self = this;
+
+    var removed = _.intersection(_.keys(self.cordovaPlugins), pluginsToRemove);
+    self.cordovaPlugins =
+      _.omit.apply(null, [self.cordovaPlugins].concat(pluginsToRemove));
+
+    var plugins = self._getCordovaPluginsFile();
+    var lines = [];
+
+    _.each(self.cordovaPlugins, function (versionString, plugin) {
+      if (versionString)
+        lines.push(plugin + '@' + versionString);
+      else
+        lines.push(plugin);
+    });
+    lines.push('\n');
+    fs.writeFileSync(plugins, lines.join('\n'), 'utf8');
+
+    return removed;
+  },
+
+  // platforms - a list of strings
+  addCordovaPlatforms: function (platforms) {
+    var self = this;
+    self.platforms = _.union(self.platforms, platforms);
+    self.writePlatformsFile();
+  },
+
+  // platforms - a list of strings
+  removeCordovaPlatforms: function (platforms) {
+    var self = this;
+    self.platforms = _.difference(self.platforms, platforms);
+    self.writePlatformsFile();
   }
 });
 

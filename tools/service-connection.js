@@ -16,7 +16,7 @@ var uniload = require("./uniload.js");
 // fast.
 //
 // - Package: a Package object as returned from uniload.load, containing
-//   the livedata and meteor packages
+//   the ddp and meteor packages
 // - endpointUrl: the url to connect to
 // - options:
 //   - headers: an object containing extra headers to use when opening the
@@ -33,9 +33,15 @@ var ServiceConnection = function (Package, endpointUrl, options) {
     // We found that this was likely to time out with the DDP default of 10s,
     // especially if the CPU is churning on bundling (eg, for the stats
     // connection which we start in parallel with bundling).
-    connectTimeoutMs: 15000,
+    connectTimeoutMs: 30000,
+    // Disable client->server heartbeats for service connections.  Users with
+    // slow internet connections were seeing heartbeat timeouts because the
+    // heartbeats were buried behind large responses (eg
+    // https://github.com/meteor/meteor/issues/2777).
+    heartbeatInterval: 0,
     retry: false,
     onConnected: function () {
+      self.connected = true;
       if (!self.currentFuture)
         throw Error("nobody waiting for connection?");
       if (self.currentFuture !== connectFuture)
@@ -45,12 +51,13 @@ var ServiceConnection = function (Package, endpointUrl, options) {
     }
   });
 
-  self.connection = Package.livedata.DDP.connect(endpointUrl, options);
+  self.connection = Package.ddp.DDP.connect(endpointUrl, options);
 
   // Wait until we have some sort of initial connection or error (including the
   // 10-second timeout built into our DDP client).
   var connectFuture = self.currentFuture = new Future;
   self.connection._stream.on('disconnect', function (error) {
+    self.connected = false;
     if (error && error.errorType === "DDP.ForcedReconnectError") {
       // OK, we requested this, probably due to version negotation failure.
       //
@@ -61,10 +68,14 @@ var ServiceConnection = function (Package, endpointUrl, options) {
       // Otherwise, ignore this error. We're going to reconnect!
       return;
     }
+    // Are we waiting to connect or for the result of a method apply or a
+    // subscribeAndWait? If so, disconnecting is a problem.
     if (self.currentFuture) {
       var fut = self.currentFuture;
       self.currentFuture = null;
-      fut.throw(error || new Error("DDP disconnected"));
+      fut.throw(error ||
+                new Package.ddp.DDP.ConnectionError(
+                  "DDP disconnected while connection in progress"));
     } else if (error) {
       // We got some sort of error with nobody listening for it; handle it.
       // XXX probably have a better way to handle it than this
@@ -105,7 +116,7 @@ _.extend(ServiceConnection.prototype, {
     return self.currentFuture.wait();
   },
 
-  // XXX derived from _subscribeAndWait in livedata_connection.js
+  // XXX derived from _subscribeAndWait in ddp_connection.js
   // -- but with a different signature..
   subscribeAndWait: function (/* arguments */) {
     var self = this;

@@ -1,3 +1,12 @@
+Blaze._globalHelpers = {};
+
+// Documented as Template.registerHelper.
+// This definition also provides back-compat for `UI.registerHelper`.
+Blaze.registerHelper = function (name, func) {
+  Blaze._globalHelpers[name] = func;
+};
+
+
 var bindIfIsFunction = function (x, target) {
   if (typeof x !== 'function')
     return x;
@@ -11,7 +20,7 @@ var bindIfIsFunction = function (x, target) {
 var bindDataContext = function (x) {
   if (typeof x === 'function') {
     return function () {
-      var data = Blaze.getCurrentData();
+      var data = Blaze.getData();
       if (data == null)
         data = {};
       return x.apply(data, arguments);
@@ -20,25 +29,60 @@ var bindDataContext = function (x) {
   return x;
 };
 
-var wrapHelper = function (f) {
-  return Blaze.wrapCatchingExceptions(f, 'template helper');
+Blaze._OLDSTYLE_HELPER = {};
+
+var getTemplateHelper = Blaze._getTemplateHelper = function (template, name) {
+  // XXX COMPAT WITH 0.9.3
+  var isKnownOldStyleHelper = false;
+
+  if (template.__helpers.has(name)) {
+    var helper = template.__helpers.get(name);
+    if (helper === Blaze._OLDSTYLE_HELPER) {
+      isKnownOldStyleHelper = true;
+    } else {
+      return helper;
+    }
+  }
+
+  // old-style helper
+  if (name in template) {
+    // Only warn once per helper
+    if (! isKnownOldStyleHelper) {
+      template.__helpers.set(name, Blaze._OLDSTYLE_HELPER);
+      if (! template._NOWARN_OLDSTYLE_HELPERS) {
+        Blaze._warn('Assigning helper with `' + template.viewName + '.' +
+                    name + ' = ...` is deprecated.  Use `' + template.viewName +
+                    '.helpers(...)` instead.');
+      }
+    }
+    return template[name];
+  }
+
+  return null;
 };
 
-// !!! FIX THIS COMMENT !!!
+var wrapHelper = function (f) {
+  return Blaze._wrapCatchingExceptions(f, 'template helper');
+};
+
+// Looks up a name, like "foo" or "..", as a helper of the
+// current template; a global helper; the name of a template;
+// or a property of the data context.  Called on the View of
+// a template (i.e. a View with a `.template` property,
+// where the helpers are).  Used for the first name in a
+// "path" in a template tag, like "foo" in `{{foo.bar}}` or
+// ".." in `{{frobulate ../blah}}`.
 //
-// Implements {{foo}} where `name` is "foo"
-// and `component` is the component the tag is found in
-// (the lexical "self," on which to look for methods).
-// If a function is found, it is bound to the object it
-// was found on.  Returns a function,
-// non-function value, or null.
+// Returns a function, a non-function value, or null.  If
+// a function is found, it is bound appropriately.
 //
 // NOTE: This function must not establish any reactive
-// dependencies.  If there is any reactivity in the
+// dependencies itself.  If there is any reactivity in the
 // value, lookup should return a function.
 Blaze.View.prototype.lookup = function (name, _options) {
   var template = this.template;
   var lookupTemplate = _options && _options.template;
+  var helper;
 
   if (/^\./.test(name)) {
     // starts with a dot. must be a series of dots which maps to an
@@ -48,16 +92,18 @@ Blaze.View.prototype.lookup = function (name, _options) {
 
     return Blaze._parentData(name.length - 1, true /*_functionWrapped*/);
 
-  } else if (template && (name in template)) {
-    return wrapHelper(bindDataContext(template[name]));
-  } else if (lookupTemplate && Template.__lookup__(name)) {
-    return Template.__lookup__(name);
-  } else if (UI._globalHelpers[name]) {
-    return wrapHelper(bindDataContext(UI._globalHelpers[name]));
+  } else if (template &&
+             ((helper = getTemplateHelper(template, name)) != null)) {
+    return wrapHelper(bindDataContext(helper));
+  } else if (lookupTemplate && (name in Blaze.Template) &&
+             (Blaze.Template[name] instanceof Blaze.Template)) {
+    return Blaze.Template[name];
+  } else if (Blaze._globalHelpers[name] != null) {
+    return wrapHelper(bindDataContext(Blaze._globalHelpers[name]));
   } else {
     return function () {
       var isCalledAsFunction = (arguments.length > 0);
-      var data = Blaze.getCurrentData();
+      var data = Blaze.getData();
       if (lookupTemplate && ! (data && data[name])) {
         throw new Error("No such template: " + name);
       }
@@ -82,9 +128,9 @@ Blaze.View.prototype.lookup = function (name, _options) {
 // Implement Spacebars' {{../..}}.
 // @param height {Number} The number of '..'s
 Blaze._parentData = function (height, _functionWrapped) {
-  var theWith = Blaze.getCurrentView('with');
+  var theWith = Blaze.getView('with');
   for (var i = 0; (i < height) && theWith; i++) {
-    theWith = Blaze.getParentView(theWith, 'with');
+    theWith = Blaze.getView(theWith, 'with');
   }
 
   if (! theWith)

@@ -14,23 +14,26 @@ var ROOT_PACKAGES = [
   'dev-bundle-fetcher',
   'ejson',
   'js-analyze',
-  'livedata',
+  'ddp',
   'logging',
   'meteor',
   'minifiers',
   'minimongo',
-  'mongo-livedata',
-  'package-version-parser'
+  'mongo',
+  'package-version-parser',
+  'boilerplate-generator',
+  'webapp-hashing',
+  'xmlbuilder'
 ];
 
-// Load unipackages into the currently running node.js process. Use
-// this to use unipackages (such as the DDP client) from command-line
+// Load isopacks into the currently running node.js process. Use
+// this to use isopacks (such as the DDP client) from command-line
 // tools (such as 'meteor'). The requested packages will be loaded
 // together will all of their dependencies, and each time you call
 // this function you load another, distinct copy of all of the
 // packages (except see note about caching below). The return value is
 // an object that maps package name to package exports (that is, it is
-// the Unipackage object from inside the sandbox created for the newly
+// the Isopack object from inside the sandbox created for the newly
 // loaded packages).
 //
 // Caching: There is a simple cache. If you call this function with
@@ -44,7 +47,7 @@ var ROOT_PACKAGES = [
 //
 // When run from a checkout, uniload only loads local (from the checkout)
 // packages: never packages from troposphere. When run from a release build,
-// uniload only loads pre-built unipackages that are distributed alongside the
+// uniload only loads pre-built isopacks that are distributed alongside the
 // tool: never local packages or packages from troposphere (so in this mode, it
 // never compiles the source of a real package).
 //
@@ -54,9 +57,9 @@ var ROOT_PACKAGES = [
 //
 // Example usage:
 //   var DDP = require('./uniload.js').load({
-//     packages: ['livedata'],
+//     packages: ['ddp'],
 //     release: release.current.name
-//   }).livedata.DDP;
+//   }).ddp.DDP;
 //   var reverse = DDP.connect('reverse.meteor.com');
 //   console.log(reverse.call('reverse', 'hello world'));
 
@@ -90,7 +93,7 @@ var load = function (options) {
 
   var ret;
   var messages = buildmessage.capture({
-    title: "loading unipackage"
+    title: "Loading isopack"
   }, function () {
     // Load the code. The uniloader does not call the constraint solver, unless
     // it is running from checkout, in which case it will use the constraint
@@ -106,7 +109,7 @@ var load = function (options) {
     // Passing in dependency versions doesn't really make any sense here. We
     // don't know the previous dependencies of this package, and, anyway, if we
     // are running from checkout, they are all +local, and if we are running
-    // from release it is a bunch of unipackages. So, we don't pass in
+    // from release it is a bunch of isopacks. So, we don't pass in
     // dependency versions.
     var image = bundler.buildJsImage({
       name: "load",
@@ -131,9 +134,9 @@ var load = function (options) {
     // happen in a built release. In the future, the command line
     // tool will be a normal Meteor app and will be built ahead of
     // time like any other app and this case will disappear.
-    process.stderr.write("Errors prevented unipackage load:\n");
+    process.stderr.write("Errors prevented isopack load:\n");
     process.stderr.write(messages.formatMessages());
-    throw new Error("unipackage load failed?");
+    throw new Error("isopack load failed?");
   }
 
   // Save to cache

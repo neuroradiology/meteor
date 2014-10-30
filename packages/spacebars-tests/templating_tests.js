@@ -21,15 +21,17 @@ Tinytest.add("spacebars-tests - templating_tests - assembly", function (test) {
   // Another production bug -- we must use LiveRange to replace the
   // placeholder, or risk breaking other LiveRanges
   Session.set("stuff", true); // XXX bad form to use Session in a test?
-  Template.test_assembly_b1.stuff = function () {
-    return Session.get("stuff");
-  };
+  Template.test_assembly_b1.helpers({
+    stuff: function () {
+      return Session.get("stuff");
+    }
+  });
   var onscreen = renderToDiv(Template.test_assembly_b0);
   test.equal(canonicalizeHtml(onscreen.innerHTML), "xyhi");
   Session.set("stuff", false);
-  Deps.flush();
+  Tracker.flush();
   test.equal(canonicalizeHtml(onscreen.innerHTML), "xhi");
-  Deps.flush();
+  Tracker.flush();
 });
 
 // Test that if a template throws an error, then pending_partials is
@@ -66,14 +68,16 @@ Tinytest.add("spacebars-tests - templating_tests - table assembly", function(tes
   test.equal(canonicalizeHtml(tds[1].innerHTML), "b");
   test.equal(canonicalizeHtml(tds[2].innerHTML), "c");
 
-  Deps.flush();
+  Tracker.flush();
 });
 
 Tinytest.add("spacebars-tests - templating_tests - event handler this", function(test) {
 
-  Template.test_event_data_with.ONE = {str: "one"};
-  Template.test_event_data_with.TWO = {str: "two"};
-  Template.test_event_data_with.THREE = {str: "three"};
+  Template.test_event_data_with.helpers({
+    ONE: {str: "one"},
+    TWO: {str: "two"},
+    THREE: {str: "three"}
+  });
 
   Template.test_event_data_with.events({
     'click': function(event, template) {
@@ -84,8 +88,7 @@ Tinytest.add("spacebars-tests - templating_tests - event handler this", function
   });
 
   var event_buf = [];
-  var containerDiv = renderToDiv(Template.test_event_data_with,
-                                 Template.test_event_data_with.ONE);
+  var containerDiv = renderToDiv(Template.test_event_data_with, {str: "one"});
   var cleanupDiv = addToBody(containerDiv);
 
   var divs = containerDiv.getElementsByTagName("div");
@@ -104,7 +107,7 @@ Tinytest.add("spacebars-tests - templating_tests - event handler this", function
   event_buf.length = 0;
 
   cleanupDiv();
-  Deps.flush();
+  Tracker.flush();
 });
 
 
@@ -158,18 +161,20 @@ if (document.addEventListener) {
 
     // clean up DOM
     cleanupDiv();
-    Deps.flush();
+    Tracker.flush();
   });
 }
 
 Tinytest.add("spacebars-tests - templating_tests - safestring", function(test) {
 
-  Template.test_safestring_a.foo = function() {
-    return "<br>";
-  };
-  Template.test_safestring_a.bar = function() {
-    return new Spacebars.SafeString("<hr>");
-  };
+  Template.test_safestring_a.helpers({
+    foo: function() {
+      return "<br>";
+    },
+    bar: function() {
+      return new Spacebars.SafeString("<hr>");
+    }
+  });
 
   var obj = {fooprop: "<br>",
              barprop: new Spacebars.SafeString("<hr>")};
@@ -183,19 +188,19 @@ Tinytest.add("spacebars-tests - templating_tests - safestring", function(test) {
 });
 
 Tinytest.add("spacebars-tests - templating_tests - helpers and dots", function(test) {
-  UI.registerHelper("platypus", function() {
+  Template.registerHelper("platypus", function() {
     return "eggs";
   });
-  UI.registerHelper("watermelon", function() {
+  Template.registerHelper("watermelon", function() {
     return "seeds";
   });
 
-  UI.registerHelper("daisygetter", function() {
+  Template.registerHelper("daisygetter", function() {
     return this.daisy;
   });
 
   // XXX for debugging
-  UI.registerHelper("debugger", function() {
+  Template.registerHelper("debugger", function() {
     debugger;
   });
 
@@ -221,12 +226,14 @@ Tinytest.add("spacebars-tests - templating_tests - helpers and dots", function(t
     };
   };
 
-  UI.registerHelper("fancyhelper", getFancyObject);
+  Template.registerHelper("fancyhelper", getFancyObject);
 
-  Template.test_helpers_a.platypus = 'bill';
-  Template.test_helpers_a.warthog = function() {
-    return 'snout';
-  };
+  Template.test_helpers_a.helpers({
+    platypus: 'bill',
+    warthog: function() {
+      return 'snout';
+    }
+  });
 
   var listFour = function(a, b, c, d, options) {
     test.isTrue(options instanceof Spacebars.kw);
@@ -331,7 +338,7 @@ Tinytest.add("spacebars-tests - templating_tests - helpers and dots", function(t
 
   // test interpretation of arguments
 
-  Template.test_helpers_h.helperListFour = listFour;
+  Template.test_helpers_h.helpers({helperListFour: listFour});
 
   html = canonicalizeHtml(
     renderToDiv(Template.test_helpers_h, dataObj).innerHTML);
@@ -354,10 +361,12 @@ Tinytest.add("spacebars-tests - templating_tests - helpers and dots", function(t
 
 Tinytest.add("spacebars-tests - templating_tests - rendered template", function(test) {
   var R = ReactiveVar('foo');
-  Template.test_render_a.foo = function() {
-    R.get();
-    return this.x + 1;
-  };
+  Template.test_render_a.helpers({
+    foo: function() {
+      R.get();
+      return this.x + 1;
+    }
+  });
 
   var div = renderToDiv(Template.test_render_a, {x: 123});
   test.equal($(div).text().match(/\S+/)[0], "124");
@@ -368,7 +377,7 @@ Tinytest.add("spacebars-tests - templating_tests - rendered template", function(
   test.isTrue(hr1);
 
   R.set('bar');
-  Deps.flush();
+  Tracker.flush();
   var br2 = div.getElementsByTagName('br')[0];
   var hr2 = div.getElementsByTagName('hr')[0];
   test.isTrue(br2);
@@ -376,16 +385,16 @@ Tinytest.add("spacebars-tests - templating_tests - rendered template", function(
   test.isTrue(hr2);
   test.isTrue(hr1 === hr2);
 
-  Deps.flush();
+  Tracker.flush();
 
   /////
 
   R = ReactiveVar('foo');
 
-  Template.test_render_b.foo = function() {
+  Template.test_render_b.helpers({foo: function() {
     R.get();
     return (+this) + 1;
-  };
+  }});
 
   div = renderToDiv(Template.test_render_b, {x: 123});
   test.equal($(div).text().match(/\S+/)[0], "201");
@@ -396,7 +405,7 @@ Tinytest.add("spacebars-tests - templating_tests - rendered template", function(
   test.isTrue(hr1);
 
   R.set('bar');
-  Deps.flush();
+  Tracker.flush();
   var br2 = div.getElementsByTagName('br')[0];
   var hr2 = div.getElementsByTagName('hr')[0];
   test.isTrue(br2);
@@ -404,7 +413,7 @@ Tinytest.add("spacebars-tests - templating_tests - rendered template", function(
   test.isTrue(hr2);
   test.isTrue(hr1 === hr2);
 
-  Deps.flush();
+  Tracker.flush();
 
 });
 
@@ -447,18 +456,19 @@ Tinytest.add("spacebars-tests - templating_tests - template arg", function (test
 
   var div = renderToDiv(Template.test_template_arg_a, {food: "pie"});
   var cleanupDiv = addToBody(div);
-  Deps.flush(); // cause `rendered` to be called
+  Tracker.flush(); // cause `rendered` to be called
   test.equal($(div).text(), "Greetings 1-bold Line");
   clickElement(div.querySelector('i'));
   test.equal($(div).text(), "Hello 3-element World (the secret is strawberry pie)");
 
   cleanupDiv();
-  Deps.flush();
+  Tracker.flush();
 });
 
 Tinytest.add("spacebars-tests - templating_tests - helpers", function (test) {
   var tmpl = Template.test_template_helpers_a;
 
+  tmpl._NOWARN_OLDSTYLE_HELPERS = true;
   tmpl.foo = 'z';
   tmpl.helpers({bar: 'b'});
   // helpers(...) takes precendence of assigned helper
@@ -466,7 +476,7 @@ Tinytest.add("spacebars-tests - templating_tests - helpers", function (test) {
 
   var div = renderToDiv(tmpl);
   test.equal($(div).text().match(/\S+/)[0], 'abc');
-  Deps.flush();
+  Tracker.flush();
 
   tmpl = Template.test_template_helpers_b;
 
@@ -486,13 +496,13 @@ Tinytest.add("spacebars-tests - templating_tests - helpers", function (test) {
   // We don't make helpers with names like toString work in IE 8.
   test.expect_fail();
   test.equal(txt, 'ABC4D');
-  Deps.flush();
+  Tracker.flush();
 
   // test that helpers don't "leak"
   tmpl = Template.test_template_helpers_c;
   div = renderToDiv(tmpl);
   test.equal($(div).text(), 'x');
-  Deps.flush();
+  Tracker.flush();
 });
 
 Tinytest.add("spacebars-tests - templating_tests - events", function (test) {
@@ -510,7 +520,7 @@ Tinytest.add("spacebars-tests - templating_tests - events", function (test) {
   clickElement($(div).find('b')[0]);
   test.equal(buf, ['b']);
   cleanupDiv();
-  Deps.flush();
+  Tracker.flush();
 
   ///
 
@@ -530,7 +540,7 @@ Tinytest.add("spacebars-tests - templating_tests - events", function (test) {
   clickElement($(div).find('i')[0]);
   test.equal(buf, ['u', 'i']);
   cleanupDiv();
-  Deps.flush();
+  Tracker.flush();
 
   //Test for identical callbacks for issue #650
   tmpl = Template.test_template_events_c;
@@ -549,13 +559,13 @@ Tinytest.add("spacebars-tests - templating_tests - events", function (test) {
   test.isTrue(_.contains(buf, 'a'));
   test.isTrue(_.contains(buf, 'b'));
   cleanupDiv();
-  Deps.flush();
+  Tracker.flush();
 });
 
 
 Tinytest.add('spacebars-tests - templating_tests - helper typecast Issue #617', function (test) {
 
-  UI.registerHelper('testTypeCasting', function (/*arguments*/) {
+  Template.registerHelper('testTypeCasting', function (/*arguments*/) {
     // Return a string representing the arguments passed to this
     // function, including types. eg:
     // (1, true) -> "[number,1][boolean,true]"
@@ -582,14 +592,28 @@ Tinytest.add('spacebars-tests - templating_tests - helper typecast Issue #617', 
 
 Tinytest.add('spacebars-tests - templating_tests - each falsy Issue #801', function (test) {
   //Minor test for issue #801 (#each over array containing nulls)
-  Template.test_template_issue801.values = function() { return [0,1,2,null,undefined,false]; };
+  Template.test_template_issue801.helpers({
+    values: function() { return [0,1,2,null,undefined,false]; }});
   var div = renderToDiv(Template.test_template_issue801);
   test.equal(canonicalizeHtml(div.innerHTML), "012");
 });
 
 Tinytest.add('spacebars-tests - templating_tests - duplicate template error', function (test) {
-  Template.__define__("test_duplicate_template", function () {});
+  Template.__checkName("test_duplicate_template");
+  Template.test_duplicate_template = new Template(
+    "dup", function () { return null; });
+
   test.throws(function () {
-    Template.__define__("test_duplicate_template", function () {});
+    Template.__checkName("test_duplicate_template");
   });
+});
+
+Tinytest.add('spacebars-tests - templating_tests - reserved template name error', function (test) {
+
+  _.each('length __proto__ prototype name body currentData instance'.split(' '),
+         function (name) {
+           test.throws(function () {
+             Template.__checkName(name);
+           }, /This template name is reserved: /);
+         });
 });

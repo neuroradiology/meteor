@@ -9,9 +9,10 @@ var release = require('./release.js');
 var runLog = require('./run-log.js');
 var catalog = require('./catalog.js');
 var archinfo = require('./archinfo.js');
-var unipackage = require('./unipackage.js');
+var isopack = require('./isopack.js');
 var utils = require('./utils.js');
 var buildmessage = require('./buildmessage.js');
+var Console = require('./console.js').Console;
 
 /**
  * Check to see if an update is available. If so, download and install
@@ -32,26 +33,54 @@ exports.tryToDownloadUpdate = function (options) {
   checkInProgress = false;
 };
 
+var firstCheck = true;
+
 var checkForUpdate = function (showBanner) {
-  var messages = buildmessage.capture(function () {
-    catalog.official.refresh({silent: true});
-
-    if (!release.current.isProperRelease())
+  if (firstCheck) {
+    // We want to avoid a potential race condition here, because we run an
+    // update almost immediately at run.  We don't want to drop the resolver
+    // cache; that would be slow.  "meteor run" itself should have run a refresh
+    // anyway.  So, the first time, we just skip the remote catalog sync.  But
+    // we do want to do the out-of-date release checks, so we can't just delay
+    // the first update cycle.
+    firstCheck = false;
+  } else {
+    // Silent is currently unused, but we keep it as a hint here...
+    try {
+      catalog.complete.refreshOfficialCatalog({silent: true});
+    } catch (err) {
+      Console.debug("Failed to refresh catalog, ignoring error", err);
       return;
-
-    updateMeteorToolSymlink();
-
-    maybeShowBanners();
-  });
-
-  if (messages.hasMessages()) {
-    // Ignore, since running in the background.
-    // XXX unfortunately the "can't refresh" message still prints :(
-    // XXX But maybe if it's just a "we're offline" message we should keep
-    //     going? In case we want to present the "hey there's a locally
-    //     available recommended release?
-    return;
+    }
   }
+
+  if (!release.current.isProperRelease())
+    return;
+
+  updateMeteorToolSymlink();
+
+  maybeShowBanners();
+};
+
+var lastShowTimes = {};
+
+var shouldShow = function (key, maxAge) {
+  var now = +(new Date);
+
+  if (maxAge === undefined) {
+    maxAge = 12 * 60 * 60 * 1000;
+  }
+
+  var lastShow = lastShowTimes[key];
+  if (lastShow !== undefined) {
+    var age = now - lastShow;
+    if (age < maxAge) {
+      return false;
+    }
+  }
+
+  lastShowTimes[key] = now;
+  return true;
 };
 
 var maybeShowBanners = function () {
@@ -107,10 +136,14 @@ var maybeShowBanners = function () {
     var patchRelease = catalog.official.getReleaseVersion(
       track, patchReleaseVersion);
     if (patchRelease && patchRelease.recommended) {
-      runLog.log("=> A patch (" +
-                 utils.displayRelease(track, patchReleaseVersion) +
-                 ") for your current release is available!");
-      runLog.log("   Update this project now with 'meteor update --patch'.");
+      var key = "patchrelease-" + track + "-" + patchReleaseVersion;
+      if (shouldShow(key)) {
+        runLog.log(
+          "=> A patch (" +
+          utils.displayRelease(track, patchReleaseVersion) +
+          ") for your current release is available!");
+        runLog.log("   Update this project now with 'meteor update --patch'.");
+      }
       return;
     }
   }
@@ -123,9 +156,12 @@ var maybeShowBanners = function () {
   var futureReleases = catalog.official.getSortedRecommendedReleaseVersions(
     track, currentReleaseOrderKey);
   if (futureReleases.length) {
-    runLog.log(
-      "=> " + utils.displayRelease(track, futureReleases[0]) +
+    var key = "futurerelease-" + track + "-" + futureReleases[0];
+    if (shouldShow(key)) {
+      runLog.log(
+        "=> " + utils.displayRelease(track, futureReleases[0]) +
         " is available. Update this project with 'meteor update'.");
+    }
     return;
   }
 };
@@ -133,8 +169,6 @@ var maybeShowBanners = function () {
 // Update ~/.meteor/meteor to point to the tool binary from the tools of the
 // latest recommended release on the default release track.
 var updateMeteorToolSymlink = function () {
-  buildmessage.assertInCapture();
-
   // Get the latest release version of METEOR. (*Always* of the default
   // track, not of whatever we happen to be running: we always want the tool
   // symlink to go to the default track.)
@@ -162,43 +196,38 @@ var updateMeteorToolSymlink = function () {
     // symlink points to. Let's make sure we have that release on disk,
     // and then update the symlink.
     try {
-      var messages = buildmessage.capture(function () {
+      buildmessage.enterJob({
+        title: "Downloading tool package " + latestRelease.tool
+      }, function () {
+        tropohouse.default.maybeDownloadPackageForArchitectures({
+          packageName: latestReleaseToolPackage,
+          version: latestReleaseToolVersion,
+          architectures: [archinfo.host()],
+          silent: true
+        });
+      });
+      _.each(latestRelease.packages, function (pkgVersion, pkgName) {
         buildmessage.enterJob({
-          title: "downloading tool package " + latestRelease.tool
+          title: "Downloading package " + pkgName + "@" + pkgVersion
         }, function () {
           tropohouse.default.maybeDownloadPackageForArchitectures({
-            packageName: latestReleaseToolPackage,
-            version: latestReleaseToolVersion,
+            packageName: pkgName,
+            version: pkgVersion,
             architectures: [archinfo.host()],
             silent: true
-          });
-        });
-        _.each(latestRelease.packages, function (pkgVersion, pkgName) {
-          buildmessage.enterJob({
-            title: "downloading package " + pkgName + "@" + pkgVersion
-          }, function () {
-            tropohouse.default.maybeDownloadPackageForArchitectures({
-              packageName: pkgName,
-              version: pkgVersion,
-              architectures: [archinfo.host()],
-              silent: true
-            });
           });
         });
       });
     } catch (err) {
       return;  // since we are running in the background.
     }
-    if (messages.hasMessages()) {
-      return;  // since we are running in the background
-    }
 
-    var toolUnipackage = new unipackage.Unipackage;
-    toolUnipackage.initFromPath(
+    var toolIsopack = new isopack.Isopack;
+    toolIsopack.initFromPath(
       latestReleaseToolPackage,
       tropohouse.default.packagePath(latestReleaseToolPackage,
                                      latestReleaseToolVersion));
-    var toolRecord = _.findWhere(toolUnipackage.toolsOnDisk,
+    var toolRecord = _.findWhere(toolIsopack.toolsOnDisk,
                                  {arch: archinfo.host()});
 
     // XXX maybe we shouldn't throw from this background thing

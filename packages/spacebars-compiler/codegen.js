@@ -14,28 +14,31 @@ var builtInBlockHelpers = SpacebarsCompiler._builtInBlockHelpers = {
 };
 
 
-// Some `UI.*` paths are special in that they generate code that
- // doesn't folow the normal lookup rules for dotted symbols. The
- // following names must be prefixed with `UI.` when you use them in a
- // template.
-var builtInUIPaths = {
-  // `template` is a local variable defined in the generated render
-  // function for the template in which `UI.contentBlock` (or
-  // `UI.elseBlock`) is invoked. `template` is a reference to the
-  // template itself.
+// Mapping of "macros" which, when preceded by `Template.`, expand
+// to special code rather than following the lookup rules for dotted
+// symbols.
+var builtInTemplateMacros = {
+  // `view` is a local variable defined in the generated render
+  // function for the template in which `Template.contentBlock` or
+  // `Template.elseBlock` is invoked.
   'contentBlock': 'view.templateContentBlock',
   'elseBlock': 'view.templateElseBlock',
 
-  // `Template` is the global template namespace. If you define a
-  // template named `foo` in Spacebars, it gets defined as
-  // `Template.foo` in JavaScript.
+  // Confusingly, this makes `{{> Template.dynamic}}` an alias
+  // for `{{> __dynamic}}`, where "__dynamic" is the template that
+  // implements the dynamic template feature.
   'dynamic': 'Template.__dynamic'
 };
 
 // A "reserved name" can't be used as a <template> name.  This
 // function is used by the template file scanner.
+//
+// Note that the runtime imposes additional restrictions, for example
+// banning the name "body" and names of built-in object properties
+// like "toString".
 SpacebarsCompiler.isReservedName = function (name) {
-  return builtInBlockHelpers.hasOwnProperty(name);
+  return builtInBlockHelpers.hasOwnProperty(name) ||
+    builtInTemplateMacros.hasOwnProperty(name);
 };
 
 var makeObjectLiteral = function (obj) {
@@ -133,18 +136,22 @@ _.extend(CodeGen.prototype, {
           // `{{#foo bar}}` is sugar for `{{#with bar}}{{#foo}}...`.
           if (dataCode) {
             includeCode =
-              'Spacebars.TemplateWith(' + dataCode + ', function () { return ' +
+              'Blaze._TemplateWith(' + dataCode + ', function () { return ' +
               includeCode + '; })';
           }
 
-          if (path[0] === 'UI' &&
+          // XXX BACK COMPAT - UI is the old name, Template is the new
+          if ((path[0] === 'UI' || path[0] === 'Template') &&
               (path[1] === 'contentBlock' || path[1] === 'elseBlock')) {
-            includeCode = 'Blaze.InOuterTemplateScope(view, function () { return '
+            // Call contentBlock and elseBlock in the appropriate scope
+            includeCode = 'Blaze._InOuterTemplateScope(view, function () { return '
               + includeCode + '; })';
           }
 
           return BlazeTools.EmitCode(includeCode);
         }
+      } else if (tag.type === 'ESCAPE') {
+        return tag.value;
       } else {
         // Can't get here; TemplateTag validation should catch any
         // inappropriate tag types that might come out of the parser.
@@ -169,15 +176,17 @@ _.extend(CodeGen.prototype, {
   codeGenPath: function (path, opts) {
     if (builtInBlockHelpers.hasOwnProperty(path[0]))
       throw new Error("Can't use the built-in '" + path[0] + "' here");
-    // Let `{{#if UI.contentBlock}}` check whether this template was invoked via
-    // inclusion or as a block helper, in addition to supporting
-    // `{{> UI.contentBlock}}`.
+    // Let `{{#if Template.contentBlock}}` check whether this template was
+    // invoked via inclusion or as a block helper, in addition to supporting
+    // `{{> Template.contentBlock}}`.
+    // XXX BACK COMPAT - UI is the old name, Template is the new
     if (path.length >= 2 &&
-        path[0] === 'UI' && builtInUIPaths.hasOwnProperty(path[1])) {
+        (path[0] === 'UI' || path[0] === 'Template')
+        && builtInTemplateMacros.hasOwnProperty(path[1])) {
       if (path.length > 2)
         throw new Error("Unexpected dotted path beginning with " +
                         path[0] + '.' + path[1]);
-      return builtInUIPaths[path[1]];
+      return builtInTemplateMacros[path[1]];
     }
 
     var firstPathItem = BlazeTools.toJSLiteral(path[0]);
