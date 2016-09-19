@@ -1,17 +1,26 @@
-var selftest = require('../selftest.js');
+var selftest = require('../tool-testing/selftest.js');
 var Sandbox = selftest.Sandbox;
+const SIMPLE_WAREHOUSE = { v1: { recommended: true } };
 
 selftest.define("create", function () {
-  var s = new Sandbox;
+  // We need a warehouse so the tool doesn't think we are running from checkout
+  var s = new Sandbox({ warehouse: SIMPLE_WAREHOUSE });
 
   // Can we create an app? Yes!
   var run = s.run("create", "foobar");
-  run.match("foobar: created");
+  run.waitSecs(60);
+  run.match("Created a new Meteor app in 'foobar'.");
   run.match("To run your new app");
   run.expectExit(0);
 
-  // Now, can we run it?
+  // Test that the release constraints have been written to .meteor/packages
   s.cd("foobar");
+  const packages = s.read(".meteor/packages");
+  if (!packages.match('meteor-base@')) {
+    selftest.fail("Failed to add a version specifier to `meteor-base` package");
+  }
+
+  // Now, can we run it?
   run = s.run();
   run.waitSecs(15);
   run.match("foobar");

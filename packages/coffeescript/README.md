@@ -1,4 +1,6 @@
 # coffeescript
+[Source code of released version](https://github.com/meteor/meteor/tree/master/packages/coffeescript) | [Source code of development version](https://github.com/meteor/meteor/tree/devel/packages/coffeescript)
+***
 
 [CoffeeScript](http://coffeescript.org/) is a little language that
 compiles into JavaScript. It provides a simple syntax without lots of
@@ -31,7 +33,7 @@ Here's how CoffeeScript works with Meteor's namespacing.
   this fit naturally inside the CoffeeScript language. If you want to
   use package-scope variables with CoffeeScript, one way is to make a
   short `.js` file that declares all of your package-scope
-  variables. They can then be used and assigned to from `.coffee`
+  variables. They can then be read, mutated, and extended in `.coffee`
   files.
 
 * If you want to share variables between `.coffee` files in the same
@@ -45,3 +47,7 @@ Here's how CoffeeScript works with Meteor's namespacing.
 Heavy CoffeeScript users, please let us know how this arrangement
 works for you, whether `share` is helpful for you, and anything else
 you'd like to see changed.
+
+### Modules and CoffeeScript
+
+See [Modules » CoffeeScript Syntax](http://docs.meteor.com/packages/modules.html#CoffeeScript).
