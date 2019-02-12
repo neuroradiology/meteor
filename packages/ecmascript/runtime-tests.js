@@ -1,17 +1,25 @@
+const isNode8OrLater = Meteor.isServer &&
+  parseInt(process.versions.node) >= 8;
+
 Tinytest.add("ecmascript - runtime - template literals", (test) => {
-  function dump(pieces) {
-    var copy = {};
-    // Can't use _.extend({}, pieces) because es5-shim adds enumerable
-    // methods to Array.prototype, and _.extend has no own property check.
-    _.each(_.keys(pieces), key => copy[key] = pieces[key]);
-    return [copy, _.toArray(arguments).slice(1)];
+  function dump(strings, ...expressions) {
+    const copy = Object.create(null);
+    Object.assign(copy, strings);
+    copy.raw = strings.raw;
+    return [copy, expressions];
   };
-  const foo = 'B';
-  // uses `babelHelpers.taggedTemplateLiteralLoose`
-  test.equal(`\u0041${foo}C`, 'ABC');
-  test.equal(dump`\u0041${foo}C`,
-             [{0:'A', 1: 'C', raw: ['\\u0041', 'C']},
-              ['B']]);
+
+  const foo = "B";
+
+  test.equal(`\u0041${foo}C`, "ABC");
+
+  test.equal(dump`\u0041${foo}C`, [{
+    0: "A",
+    1: "C",
+    raw: ["\\u0041", "C"]
+  }, [
+    "B"
+  ]]);
 });
 
 Tinytest.add("ecmascript - runtime - classes - basic", (test) => {
@@ -22,9 +30,10 @@ Tinytest.add("ecmascript - runtime - classes - basic", (test) => {
       }
     }
 
-    test.throws(() => {
-      Foo(); // called without `new`
-    });
+    // Babel 7 no longer forbids constructor calls in loose mode.
+    // test.throws(() => {
+    //   Foo(); // called without `new`
+    // });
 
     test.equal((new Foo(3)).x, 3);
   }
@@ -37,9 +46,10 @@ Tinytest.add("ecmascript - runtime - classes - basic", (test) => {
     }
     class Foo extends Bar {}
 
-    test.throws(() => {
-      Foo(); // called without `new`
-    });
+    // Babel 7 no longer forbids constructor calls in loose mode.
+    // test.throws(() => {
+    //   Foo(); // called without `new`
+    // });
 
     test.equal((new Foo(3)).x, 3);
     test.isTrue((new Foo(3)) instanceof Foo);
@@ -146,6 +156,38 @@ if (Meteor.isServer) {
     test.equal(Foo.three, 3);
   });
 }
+
+export const testExport = "oyez";
+
+Tinytest.add("ecmascript - runtime - classes - properties", (test) => {
+  class ClassWithProperties {
+    property = ["prop", "rty"].join("e");
+    static staticProp = 1234;
+
+    check = (self) => {
+      import { testExport as oyez } from "./runtime-tests.js";
+      test.equal(oyez, "oyez");
+      test.isTrue(self === this);
+      test.equal(this.property, "property");
+    };
+
+    method() {
+      import { testExport as oyez } from "./runtime-tests.js";
+      test.equal(oyez, "oyez");
+    }
+  }
+
+  test.equal(ClassWithProperties.staticProp, 1234);
+
+  const cwp = new ClassWithProperties();
+
+  cwp.check(cwp);
+
+  // Check binding of arrow function.
+  cwp.check.call(null, cwp);
+
+  cwp.method();
+});
 
 Tinytest.add("ecmascript - runtime - block scope", (test) => {
   {
@@ -255,9 +297,6 @@ Tinytest.add("ecmascript - runtime - Set spread", (test) => {
 });
 
 Tinytest.add("ecmascript - runtime - destructuring", (test) => {
-  // uses `babelHelpers.objectWithoutProperties` and
-  // `babelHelpers.objectDestructuringEmpty`
-
   const obj = {a:1, b:2};
   const {a, ...rest} = obj;
   test.equal(a, 1);
@@ -267,12 +306,12 @@ Tinytest.add("ecmascript - runtime - destructuring", (test) => {
 
   test.throws(() => {
     const {} = null;
-  }, /Cannot destructure undefined/);
+  });
 
   const [x, y, z] = function*() {
-    let x = 1;
+    let n = 1;
     while (true) {
-      yield x++;
+      yield n++;
     }
   }();
 
@@ -322,4 +361,26 @@ Tinytest.addAsync("ecmascript - runtime - misc support", (test, done) => {
       test.instanceOf(Fiber.current, Fiber);
     }
   }).then(done, error => test.exception(error));
+});
+
+Tinytest.addAsync("ecmascript - runtime - async fibers", (test, done) => {
+  if (! Meteor.isServer) {
+    return done();
+  }
+
+  const Fiber = Npm.require("fibers");
+
+  function wait() {
+    return new Promise(resolve => setTimeout(resolve, 10));
+  }
+
+  async function check() {
+    const fiberBeforeAwait = Fiber.current;
+    await wait();
+    const fiberAfterAwait = Fiber.current;
+    test.isTrue(fiberBeforeAwait instanceof Fiber);
+    test.isTrue(fiberBeforeAwait === fiberAfterAwait);
+  }
+
+  check().then(done);
 });

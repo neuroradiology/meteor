@@ -164,7 +164,7 @@
 var _ = require('underscore');
 var Fiber = require('fibers');
 
-var enabled = !! process.env['METEOR_PROFILE'];
+Profile.enabled = !! process.env['METEOR_PROFILE'];
 var filter = parseFloat(process.env['METEOR_PROFILE']); // ms
 if (isNaN(filter)) {
   filter = 100; // ms
@@ -250,19 +250,19 @@ var start = function () {
   running = true;
 };
 
-var Profile = function (bucketName, f) {
-  if (! enabled) {
+function Profile(bucketName, f) {
+  if (! Profile.enabled) {
     return f;
   }
 
-  return function (...args) {
+  return Object.assign(function profileWrapper() {
     if (! running) {
-      return f.apply(this, args);
+      return f.apply(this, arguments);
     }
 
     var name;
     if (_.isFunction(bucketName)) {
-      name = bucketName.apply(this, args);
+      name = bucketName.apply(this, arguments);
     } else {
       name = bucketName;
     }
@@ -280,7 +280,7 @@ var Profile = function (bucketName, f) {
     var start = process.hrtime();
     var err = null;
     try {
-      return f.apply(this, args);
+      return f.apply(this, arguments);
     }
     catch (e) {
       err = e;
@@ -298,8 +298,8 @@ var Profile = function (bucketName, f) {
     if (err) {
       throw err;
     }
-  };
-};
+  }, f);
+}
 
 var time = function (bucket, f) {
   return Profile(bucket, f)();
@@ -386,7 +386,8 @@ var injectOtherTime = function (entry) {
   entries.push(other);
 };
 
-var reportOn = function (entry, isLastLeafStack = []) {
+var reportOn = function (entry, isLastLeafStack) {
+  isLastLeafStack = isLastLeafStack || [];
   var stats = entryStats(entry);
   var isParent = hasSignificantChildren(entry);
   var name = entryName(entry);
@@ -469,7 +470,7 @@ var setupReport = function () {
 var reportNum = 1;
 
 var report = function () {
-  if (! enabled) {
+  if (! Profile.enabled) {
     return;
   }
   running = false;
@@ -485,7 +486,7 @@ var report = function () {
 };
 
 var run = function (bucketName, f) {
-  if (! enabled) {
+  if (! Profile.enabled) {
     return f();
   } else if (running) {
     // We've kept the calls to Profile.run in the tool disjoint so far,

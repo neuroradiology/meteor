@@ -26,17 +26,15 @@ var testMeteorMongo = function (appDir) {
   s.cd(appDir);
 
   var run = s.run();
-  run.waitSecs(15);
   run.match(appDir);
   run.match('proxy');
+  run.waitSecs(15);
   run.match('Started MongoDB');
 
   var mongoRun = s.run('mongo');
-  mongoRun.match('MongoDB shell');
-  mongoRun.match('connecting to: 127.0.0.1');
   // Note: when mongo shell's input is not a tty, there is no prompt.
   mongoRun.write('db.version()\n');
-  mongoRun.match(/3\.2\.\d+/);
+  mongoRun.match(/4\.\d+\.\d+/);
   mongoRun.stop();
 
   run.stop();
@@ -55,4 +53,33 @@ selftest.define("meteor mongo", function () {
 // https://github.com/meteor/windows-preview/issues/145
 selftest.define("meteor mongo in unicode dir", function () {
   testMeteorMongo('asdf\u0442asdf');
+});
+
+selftest.define("mongo with multiple --port numbers (#7563)", function () {
+  var s = new Sandbox();
+  s.createApp("mongo-multiple-ports", "mongo-sanity");
+  s.cd("mongo-multiple-ports");
+
+  function check(args, matches) {
+    const run = s.run(...args);
+    run.waitSecs(30);
+    matches.forEach(m => {
+      run.waitSecs(10);
+      run.match(m);
+    });
+    run.stop();
+  }
+
+  // Make absolutely sure we're creating the database for the first time.
+  check(["reset"], ["Project reset."]);
+
+  let count = 0;
+  function next() {
+    return ["Started MongoDB", "count: " + (++count)];
+  }
+
+  check(["run"], next());
+  check(["--port", "4321"], next());
+  check(["--port", "4123"], next());
+  check([], next());
 });

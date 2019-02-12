@@ -7,6 +7,7 @@ import semver from 'semver';
 import files from '../fs/files.js';
 import utils from '../utils/utils.js';
 import { Console } from '../console/console.js';
+import { Profile } from '../tool-env/profile.js';
 import buildmessage from '../utils/buildmessage.js';
 import main from '../cli/main.js';
 import httpHelpers from '../utils/http-helpers.js';
@@ -16,8 +17,8 @@ import './protect-string-proto.js'; // must always come before 'cordova-lib'
 import { cordova as cordova_lib, events as cordova_events, CordovaError }
   from 'cordova-lib';
 import cordova_util from 'cordova-lib/src/cordova/util.js';
-import superspawn from 'cordova-lib/node_modules/cordova-common/src/superspawn.js';
-import PluginInfoProvider from 'cordova-lib/node_modules/cordova-common/src/PluginInfo/PluginInfoProvider.js';
+import superspawn from 'cordova-common/src/superspawn.js';
+import PluginInfoProvider from 'cordova-common/src/PluginInfo/PluginInfoProvider.js';
 
 import { CORDOVA_PLATFORMS, CORDOVA_PLATFORM_VERSIONS, displayNameForPlatform, displayNamesForPlatforms,
   newPluginId, convertPluginVersions, convertToGitUrl } from './index.js';
@@ -51,28 +52,29 @@ const pinnedPlatformVersions = CORDOVA_PLATFORM_VERSIONS;
 // Versions are taken from cordova-lib's package.json and should be updated
 // when we update to a newer version of cordova-lib.
 const pinnedPluginVersions = {
-  "cordova-plugin-battery-status": "1.1.1",
-  "cordova-plugin-camera": "2.1.1",
-  "cordova-plugin-console": "1.0.2",
-  "cordova-plugin-contacts": "2.0.1",
-  "cordova-plugin-device": "1.1.1",
-  "cordova-plugin-device-motion": "1.2.0",
-  "cordova-plugin-device-orientation": "1.0.2",
-  "cordova-plugin-dialogs": "1.2.0",
-  "cordova-plugin-file": "4.1.1",
-  "cordova-plugin-file-transfer": "1.5.0",
-  "cordova-plugin-geolocation": "2.1.0",
-  "cordova-plugin-globalization": "1.0.3",
-  "cordova-plugin-inappbrowser": "1.3.0",
-  "cordova-plugin-legacy-whitelist": "1.1.1",
-  "cordova-plugin-media": "2.2.0",
-  "cordova-plugin-media-capture": "1.2.0",
-  "cordova-plugin-network-information": "1.2.0",
-  "cordova-plugin-splashscreen": "3.2.1",
-  "cordova-plugin-statusbar": "2.1.2",
-  "cordova-plugin-test-framework": "1.1.1",
-  "cordova-plugin-vibration": "2.1.0",
-  "cordova-plugin-whitelist": "1.2.1"
+  "cordova-plugin-battery-status": "1.2.4",
+  "cordova-plugin-camera": "2.4.1",
+  "cordova-plugin-console": "1.1.0", // Deprecated, remove in future
+  "cordova-plugin-contacts": "2.3.1",
+  "cordova-plugin-device": "1.1.6",
+  "cordova-plugin-device-motion": "2.0.0", // Deprecated, remove in future
+  "cordova-plugin-device-orientation": "2.0.0", // Deprecated, remove in future
+  "cordova-plugin-dialogs": "1.3.3",
+  "cordova-plugin-file": "4.3.3",
+  "cordova-plugin-file-transfer": "1.6.3",
+  "cordova-plugin-geolocation": "2.4.3",
+  "cordova-plugin-globalization": "1.0.7",
+  "cordova-plugin-inappbrowser": "1.7.1",
+  "cordova-plugin-legacy-whitelist": "1.1.2",
+  "cordova-plugin-media": "3.0.1",
+  "cordova-plugin-media-capture": "1.4.3",
+  "cordova-plugin-network-information": "1.3.3",
+  "cordova-plugin-splashscreen": "4.1.0",
+  "cordova-plugin-statusbar": "2.3.0",
+  "cordova-plugin-test-framework": "1.1.5",
+  "cordova-plugin-vibration": "2.1.5",
+  "cordova-plugin-whitelist": "1.3.2",
+  "cordova-plugin-wkwebview-engine": "1.1.3"
 }
 
 export class CordovaProject {
@@ -108,6 +110,12 @@ export class CordovaProject {
           return true;
         }
 
+        if (! semver.valid(pinnedVersion)) {
+          // If pinnedVersion is not a semantic version but instead
+          // something like a GitHub tarball URL, assume not outdated.
+          return false;
+        }
+
         return semver.lt(installedVersion, pinnedVersion);
       });
 
@@ -137,8 +145,12 @@ outdated platforms`);
       // confused
       files.mkdir_p(files.pathJoin(templatePath, 'www'));
 
-      const builder = new CordovaBuilder(this.projectContext, templatePath,
-        { mobileServerUrl, settingsFile } = this.options);
+      const builder = new CordovaBuilder(
+        this.projectContext,
+        templatePath,
+        { mobileServerUrl: this.options.mobileServerUrl,
+          settingsFile: this.options.settingsFile }
+      );
 
       builder.processControlFile();
 
@@ -152,15 +164,21 @@ outdated platforms`);
       // Create the Cordova project root directory
       files.mkdir_p(files.pathDirname(this.projectRoot));
 
-      const config = { lib:
-        { www: { url: files.convertToOSPath(templatePath) } } };
+      const config = {
+        lib: {
+          www: {
+            url: files.convertToOSPath(templatePath),
+            template: true
+          }
+        }
+      };
 
       // Don't set cwd to project root in runCommands because it doesn't
       // exist yet
       this.runCommands('creating Cordova project', async () => {
         // No need to pass in appName and appId because these are set from
         // the generated config.xml
-        await cordova_lib.raw.create(files.convertToOSPath(this.projectRoot),
+        await cordova_lib.create(files.convertToOSPath(this.projectRoot),
           undefined, undefined, config);
       }, undefined, null);
     }
@@ -176,8 +194,12 @@ outdated platforms`);
 
     Console.debug('Preparing Cordova project from app bundle');
 
-    const builder = new CordovaBuilder(this.projectContext, this.projectRoot,
-      { mobileServerUrl, settingsFile } = this.options);
+    const builder = new CordovaBuilder(
+      this.projectContext,
+      this.projectRoot,
+      { mobileServerUrl: this.options.mobileServerUrl,
+        settingsFile: this.options.settingsFile }
+    );
 
     builder.processControlFile();
 
@@ -211,12 +233,19 @@ outdated platforms`);
   prepareForPlatform(platform) {
     assert(platform);
 
+    // Temporary workaround for Cordova iOS bug until
+    // https://issues.apache.org/jira/browse/CB-11731 has been released
+    delete require.cache[files.pathJoin(this.projectRoot,
+      'platforms/ios/cordova/lib/configMunger.js')];
+    delete require.cache[files.pathJoin(this.projectRoot,
+      'platforms/ios/cordova/lib/prepare.js')];
+
     const commandOptions = _.extend(this.defaultOptions,
       { platforms: [platform] });
 
     this.runCommands(`preparing Cordova project for platform \
 ${displayNameForPlatform(platform)}`, async () => {
-      await cordova_lib.raw.prepare(commandOptions);
+      await cordova_lib.prepare(commandOptions);
     });
   }
 
@@ -230,7 +259,7 @@ ${displayNameForPlatform(platform)}`, async () => {
 
     this.runCommands(`building Cordova app for platform \
 ${displayNameForPlatform(platform)}`, async () => {
-      await cordova_lib.raw.build(commandOptions);
+      await cordova_lib.build(commandOptions);
     });
   }
 
@@ -279,7 +308,7 @@ platform to your project first.`);
     const allRequirements = this.runCommands(`checking Cordova \
 requirements for platform ${displayNameForPlatform(platform)}`,
       async () => {
-        return await cordova_lib.raw.requirements([platform],
+        return await cordova_lib.requirements([platform],
           this.defaultOptions);
       });
     let requirements = allRequirements && allRequirements[platform];
@@ -311,10 +340,10 @@ to build apps for ${displayNameForPlatform(platform)}.`);
       Console.info();
 
       Console.info("Status of the individual requirements:");
-      for (requirement of requirements) {
+      for (const requirement of requirements) {
         const name = requirement.name;
         if (requirement.installed) {
-          Console.success(name);
+          Console.success(name, "installed");
         } else {
           const reason = requirement.metadata && requirement.metadata.reason;
           if (reason) {
@@ -350,7 +379,7 @@ to build apps for ${displayNameForPlatform(platform)}.`);
   updatePlatforms(platforms = this.listInstalledPlatforms()) {
     this.runCommands(`updating Cordova project for platforms \
 ${displayNamesForPlatforms(platforms)}`, async () => {
-      await cordova_lib.raw.platform('update', platforms, this.defaultOptions);
+      await cordova_lib.platform('update', platforms, this.defaultOptions);
     });
   }
 
@@ -359,14 +388,14 @@ ${displayNamesForPlatforms(platforms)}`, async () => {
 to Cordova project`, async () => {
       let version = pinnedPlatformVersions[platform];
       let platformSpec = version ? `${platform}@${version}` : platform;
-      await cordova_lib.raw.platform('add', platformSpec, this.defaultOptions);
+      await cordova_lib.platform('add', platformSpec, this.defaultOptions);
     });
   }
 
   removePlatform(platform) {
     this.runCommands(`removing platform ${displayNameForPlatform(platform)} \
 from Cordova project`, async () => {
-      await cordova_lib.raw.platform('rm', platform, this.defaultOptions);
+      await cordova_lib.platform('rm', platform, this.defaultOptions);
     });
   }
 
@@ -381,7 +410,7 @@ from Cordova project`, async () => {
 
     const installedPlatforms = this.listInstalledPlatforms();
 
-    for (platform of platforms) {
+    for (let platform of platforms) {
       if (_.contains(installedPlatforms, platform)) {
         continue;
       }
@@ -389,7 +418,7 @@ from Cordova project`, async () => {
       this.addPlatform(platform);
     }
 
-    for (platform of installedPlatforms) {
+    for (let platform of installedPlatforms) {
       if (!_.contains(platforms, platform) &&
         _.contains(CORDOVA_PLATFORMS, platform)) {
         this.removePlatform(platform);
@@ -404,15 +433,16 @@ from Cordova project`, async () => {
   // tell us if plugins have been fetched from a Git SHA URL or a local path.
   // So we overwrite the declared versions with versions from
   // listFetchedPluginVersions that do contain this information.
-  listInstalledPluginVersions() {
+  listInstalledPluginVersions(usePluginInfoId = false) {
     const pluginInfoProvider = new PluginInfoProvider();
     const installedPluginVersions = pluginInfoProvider.getAllWithinSearchPath(
       files.convertToOSPath(this.pluginsDir));
     const fetchedPluginVersions = this.listFetchedPluginVersions();
     return _.object(installedPluginVersions.map(pluginInfo => {
-      const id = pluginInfo.id;
-      const version = fetchedPluginVersions[id] || pluginInfo.version;
-      return [id, version];
+      const fetchedPlugin = fetchedPluginVersions[pluginInfo.id];
+      const id = fetchedPlugin.id;
+      const version = fetchedPlugin.version || pluginInfo.version;
+      return [usePluginInfoId ? pluginInfo.id : id, version];
     }));
   }
 
@@ -431,17 +461,21 @@ from Cordova project`, async () => {
 
     const fetchedPluginsMetadata = JSON.parse(files.readFile(
       fetchJsonPath, 'utf8'));
-    return _.object(_.map(fetchedPluginsMetadata, (metadata, id) => {
+    return _.object(_.map(fetchedPluginsMetadata, (metadata, name) => {
       const source = metadata.source;
+
+      const idWithVersion = source.id ? source.id : name;
+      const scoped = idWithVersion[0] === '@';
+      const id = `${scoped ? '@' : ''}${idWithVersion.split('@')[scoped ? 1 : 0]}`;
       let version;
       if (source.type === 'registry') {
-        version = source.id.split('@')[1];
+        version = idWithVersion.split('@')[scoped ? 2 : 1];
       } else if (source.type === 'git') {
-        version = `${source.url}#${source.ref}`;
+        version = `${source.url}${'ref' in source ? `#${source.ref}` : ''}`;
       } else if (source.type === 'local') {
         version = `file://${source.path}`;
       }
-      return [id, version];
+      return [name, { id, version }];
     }));
   }
 
@@ -493,9 +527,7 @@ from Cordova project`, async () => {
         { cli_variables: config, link: utils.isUrlWithFileScheme(version) });
 
       this.runCommands(`adding plugin ${target} \
-to Cordova project`, async () => {
-        await cordova_lib.raw.plugin('add', [target], commandOptions);
-      });
+to Cordova project`, cordova_lib.plugin.bind(undefined, 'add', [target], commandOptions));
     }
   }
 
@@ -506,9 +538,7 @@ to Cordova project`, async () => {
     }
 
     this.runCommands(`removing plugins ${plugins} \
-from Cordova project`, async () => {
-      await cordova_lib.raw.plugin('rm', plugins, this.defaultOptions);
-    });
+from Cordova project`, cordova_lib.plugin.bind(undefined, 'rm', plugins, this.defaultOptions));
   }
 
   // Ensures that the Cordova plugins are synchronized with the app-level
@@ -578,28 +608,57 @@ mobile-config.js accordingly.`);
             installedPluginVersions[id] !== version) {
             // We do not have the plugin installed or the version has changed.
             shouldReinstallAllPlugins = true;
+            Console.debug(`Plugin ${id} version have changed or it was added, will \
+perform cordova plugins reinstall`);
           }
         }
       });
 
-      if (!_.isEmpty(pluginsFromLocalPath)) {
-        Console.debug('Reinstalling Cordova plugins added from the local path');
-      }
+      const installedPluginsByName = Object.keys(this.listInstalledPluginVersions(true));
 
       // Check to see if we have any installed plugins that are not in the
       // current set of plugins.
-      _.each(installedPluginVersions, (version, id) => {
-        if (!_.has(pluginVersions, id)) {
-          shouldReinstallAllPlugins = true;
-        }
-      });
+      if (!shouldReinstallAllPlugins) {
+        // We need to know which plugins were installed because they were
+        // declared in cordova-plugins and which are just dependencies of others.
+        // Luckily for us android.json and ios.json have that information.
+        const androidJsonPath = files.pathJoin(this.pluginsDir, 'android.json');
+        const iosJsonPath = files.pathJoin(this.pluginsDir, 'ios.json');
+
+        const androidJson = files.exists(androidJsonPath) ? JSON.parse(files.readFile(
+          androidJsonPath, 'utf8')) : { installed_plugins: {} };
+        const iosJson = files.exists(iosJsonPath) ? JSON.parse(files.readFile(
+          iosJsonPath, 'utf8')) : { installed_plugins: {} };
+
+        let previouslyInstalledPlugins = _.union(
+          Object.keys(androidJson.installed_plugins), Object.keys(iosJson.installed_plugins));
+
+        // Now the problem is we have a list of names the plugins (name defined in the plugin.xml)
+        // while in cordova-plugins we have can have their npm ids. We need to translate the list.
+        const fetched = this.listFetchedPluginVersions();
+        previouslyInstalledPlugins = previouslyInstalledPlugins.map(name => {
+          return fetched[name].id;
+        });
+
+        previouslyInstalledPlugins.forEach(id => {
+          if (!_.has(pluginVersions, id)) {
+            Console.debug(`Plugin ${id} was removed, will \
+perform cordova plugins reinstall`);
+            shouldReinstallAllPlugins = true;
+          }
+        });
+      }
+
+      if (!_.isEmpty(pluginsFromLocalPath) && !shouldReinstallAllPlugins) {
+        Console.debug('Reinstalling Cordova plugins added from the local path');
+      }
 
       // We either reinstall all plugins or only those fetched from a local
       // path.
       if (shouldReinstallAllPlugins || !_.isEmpty(pluginsFromLocalPath)) {
         let pluginsToRemove;
         if (shouldReinstallAllPlugins) {
-          pluginsToRemove = Object.keys(installedPluginVersions);
+          pluginsToRemove = installedPluginsByName;
         } else {
           // Only try to remove plugins that are currently installed.
           pluginsToRemove = _.intersection(
@@ -608,6 +667,8 @@ mobile-config.js accordingly.`);
         }
 
         this.removePlugins(pluginsToRemove);
+
+        let pluginVersionsToInstall;
 
         // Now install the necessary plugins.
         if (shouldReinstallAllPlugins) {
@@ -628,8 +689,51 @@ mobile-config.js accordingly.`);
             end: pluginsToInstallCount
           });
         });
+
+        this.ensurePluginsWereInstalled(pluginVersionsToInstall, pluginsConfiguration, true);
       }
     });
+  }
+
+  // Ensures that the Cordova plugins are installed
+  ensurePluginsWereInstalled(requiredPlugins, pluginsConfiguration, retryInstall) {
+    // List of all installed plugins. This should work for global / local / scoped cordova plugins.
+    // Examples:
+    // cordova-plugin-whitelist@1.3.2 => { 'cordova-plugin-whitelist': '1.3.2' }
+    // com.cordova.plugin@file://.cordova-plugins/plugin => { 'com.cordova.plugin': 'file://.cordova-plugins/plugin' }
+    // @scope/plugin@1.0.0 => { 'com.cordova.plugin': 'scope/plugin' }
+    const installed = this.listInstalledPluginVersions();
+    const installedPluginsNames = Object.keys(installed);
+    const installedPluginsVersions = Object.values(installed);
+    const missingPlugins = {};
+
+    Object.keys(requiredPlugins).filter(plugin => {
+      if (!installedPluginsNames.includes(plugin)) {
+        Console.debug(`Plugin ${plugin} was not installed.`);
+        if (retryInstall) {
+          Console.debug(`Retrying to install ${plugin}.`);
+          this.addPlugin(
+            plugin,
+            requiredPlugins[plugin],
+            pluginsConfiguration[plugin]
+          );
+        }
+        missingPlugins[plugin] = requiredPlugins[plugin];
+      }
+    });
+
+    // All plugins were installed
+    if (Object.keys(missingPlugins).length === 0) {
+      return;
+    }
+
+    // Check one more time after re-installation.
+    if (retryInstall) {
+      this.ensurePluginsWereInstalled(missingPlugins, pluginsConfiguration, false);
+    } else {
+      // Fail, to prevent building and publishing faulty mobile app without at this moment we need to stop.
+      throw new Error(`Some Cordova plugins installation failed: (${Object.keys(missingPlugins).join(', ')}).`);
+    }
   }
 
   ensurePinnedPluginVersions(pluginVersions) {
@@ -734,3 +838,16 @@ running again with the --verbose option to help diagnose the issue.)`),
     }
   }
 }
+
+const CPp = CordovaProject.prototype;
+["prepareFromAppBundle",
+ "prepareForPlatform",
+ "buildForPlatform",
+].forEach(name => {
+  CPp[name] = Profile(platform => {
+    const prefix = `CordovaProject#${name}`;
+    return name.endsWith("ForPlatform") ? `${prefix} for ${
+      displayNameForPlatform(platform)
+    }` : prefix;
+  }, CPp[name]);
+});

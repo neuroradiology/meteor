@@ -21,7 +21,6 @@ var sourceMapRetrieverStack = require('../tool-env/source-map-retriever-stack.js
 var utils = require('../utils/utils.js');
 var cleanup = require('../tool-env/cleanup.js');
 var buildmessage = require('../utils/buildmessage.js');
-var watch = require('./watch.js');
 var fiberHelpers = require('../utils/fiber-helpers.js');
 var colonConverter = require('../utils/colon-converter.js');
 
@@ -48,6 +47,22 @@ var useParsedSourceMap = function (pathForSourceMap) {
 
 // Try this source map first
 sourceMapRetrieverStack.push(useParsedSourceMap);
+
+// Fibers are disabled by default for files.* operations unless
+// process.env.METEOR_DISABLE_FS_FIBERS parses to a falsy value.
+const YIELD_ALLOWED = !! (
+  _.has(process.env, "METEOR_DISABLE_FS_FIBERS") &&
+  ! JSON.parse(process.env.METEOR_DISABLE_FS_FIBERS));
+
+function canYield() {
+  return Fiber.current &&
+    Fiber.yield &&
+    ! Fiber.yield.disallowed;
+}
+
+function mayYield() {
+  return YIELD_ALLOWED && canYield();
+}
 
 // given a predicate function and a starting path, traverse upwards
 // from the path until we find a path that satisfies the predicate.
@@ -205,8 +220,9 @@ files.getCurrentNodeBinDir = function () {
 
 // Return the top-level directory for this meteor install or checkout
 files.getCurrentToolsDir = function () {
-  var dirname = files.convertToStandardPath(__dirname);
-  return files.pathJoin(dirname, '..', '..');
+  return files.pathDirname(
+    files.pathDirname(
+      files.convertToStandardPath(__dirname)));
 };
 
 // Read a settings file and sanity-check it. Returns a string on
@@ -215,7 +231,7 @@ files.getCurrentToolsDir = function () {
 files.getSettings = function (filename, watchSet) {
   buildmessage.assertInCapture();
   var absPath = files.pathResolve(filename);
-  var buffer = watch.readAndWatchFile(watchSet, absPath);
+  var buffer = require("./watch.js").readAndWatchFile(watchSet, absPath);
   if (buffer === null) {
     buildmessage.error("file not found (settings file)",
                        { file: filename });
@@ -229,6 +245,10 @@ files.getSettings = function (filename, watchSet) {
   }
 
   var str = buffer.toString('utf8');
+
+  // The use of a byte order mark crashes JSON parsing. Since a BOM is not
+  // required (or recommended) when using UTF-8, let's remove it if it exists.
+  str = str.charCodeAt(0) === 0xFEFF ? str.slice(1) : str;
 
   // Ensure that the string is parseable in JSON, but there's no reason to use
   // the object value of it yet.
@@ -277,44 +297,37 @@ function statOrNull(path, preserveSymlinks) {
   }
 }
 
-// Like rm -r.
-files.rm_recursive = Profile("files.rm_recursive", function (p) {
-  if (Fiber.current && Fiber.yield && ! Fiber.yield.disallowed) {
-    new Promise((resolve, reject) => {
-      rimraf(files.convertToOSPath(p), err => {
-        err ? reject(err) : resolve();
-      });
-    }).await();
-  } else {
-    rimraf.sync(files.convertToOSPath(p));
-  }
-});
-
-// Makes all files in a tree read-only.
-var makeTreeReadOnly = function (p) {
+export function realpathOrNull(path) {
   try {
-    // the l in lstat is critical -- we want to ignore symbolic links
-    var stat = files.lstat(p);
+    return files.realpath(path);
   } catch (e) {
-    if (e.code == "ENOENT") {
+    if (e.code !== "ENOENT") throw e;
+    return null;
+  }
+}
+
+files.rm_recursive_async = (path) => {
+  return new Promise((resolve, reject) => {
+    rimraf(files.convertToOSPath(path), err => err
+      ? reject(err)
+      : resolve());
+  });
+};
+
+// Like rm -r.
+files.rm_recursive = Profile("files.rm_recursive", (path) => {
+  try {
+    rimraf.sync(files.convertToOSPath(path));
+  } catch (e) {
+    if ((e.code === "ENOTEMPTY" ||
+         e.code === "EPERM") &&
+        canYield()) {
+      files.rm_recursive_async(path).await();
       return;
     }
     throw e;
   }
-
-  if (stat.isDirectory()) {
-    _.each(files.readdir(p), function (file) {
-      makeTreeReadOnly(files.pathJoin(p, file));
-    });
-  }
-  if (stat.isFile()) {
-    var permissions = stat.mode & 0o777;
-    var readOnlyPermissions = permissions & 0o555;
-    if (permissions !== readOnlyPermissions) {
-      files.chmod(p, readOnlyPermissions);
-    }
-  }
-};
+});
 
 // Returns the base64 SHA256 of the given file.
 files.fileHash = function (filename) {
@@ -472,12 +485,14 @@ files.cp_r = function(from, to, options = {}) {
         return;
       }
 
+      const fullFrom = files.pathJoin(from, f);
+
       if (options.transformFilename) {
         f = options.transformFilename(f);
       }
 
       files.cp_r(
-        files.pathJoin(from, f),
+        fullFrom,
         files.pathJoin(to, f),
         options
       );
@@ -489,7 +504,7 @@ files.cp_r = function(from, to, options = {}) {
   files.mkdir_p(files.pathDirname(to));
 
   if (stat.isSymbolicLink()) {
-    files.symlink(files.readlink(from), to);
+    symlinkWithOverwrite(files.readlink(from), to);
 
   } else {
     // Create the file as readable and writable by everyone, and
@@ -510,6 +525,38 @@ files.cp_r = function(from, to, options = {}) {
     }
   }
 };
+
+// create a symlink, overwriting the target link, file, or directory
+// if it exists
+export function symlinkWithOverwrite(source, target) {
+  const args = [source, target];
+
+  if (process.platform === "win32") {
+    const absoluteSource = files.pathResolve(target, source);
+
+    if (files.stat(absoluteSource).isDirectory()) {
+      args[2] = "junction";
+    }
+  }
+
+  try {
+    files.symlink(...args);
+  } catch (e) {
+    if (e.code === "EEXIST") {
+      if (files.lstat(target).isSymbolicLink() &&
+          files.readlink(target) === source) {
+        // If the target already points to the desired source, we don't
+        // need to do anything.
+        return;
+      }
+      // overwrite existing link, file, or directory
+      files.rm_recursive(target);
+      files.symlink(...args);
+    } else {
+      throw e;
+    }
+  }
+}
 
 /**
  * Get every path in a directory recursively, treating symlinks as files
@@ -614,7 +661,7 @@ var copyFileHelper = function (from, to, mode) {
 // directory. Only the current user is allowed to read or write the
 // files in the directory (or add files to it). The directory will
 // be cleaned up on exit.
-var tempDirs = [];
+const tempDirs = Object.create(null);
 files.mkdtemp = function (prefix) {
   var make = function () {
     prefix = prefix || 'mt-';
@@ -649,63 +696,52 @@ files.mkdtemp = function (prefix) {
     throw new Error("failed to make temporary directory in " + tmpDir);
   };
   var dir = make();
-  tempDirs.push(dir);
+  tempDirs[dir] = true;
   return dir;
 };
 
 // Call this if you're done using a temporary directory. It will asynchronously
 // be deleted.
-files.freeTempDir = function (tempDir) {
-  if (! _.contains(tempDirs, tempDir)) {
-    throw Error("not a tracked temp dir: " + tempDir);
+files.freeTempDir = function (dir) {
+  if (! tempDirs[dir]) {
+    throw Error("not a tracked temp dir: " + dir);
   }
+
   if (process.env.METEOR_SAVE_TMPDIRS) {
     return;
   }
-  setImmediate(function () {
-    // note: rm_recursive can yield, so it's possible that during this
-    // rm_recursive call, the onExit rm_recursive fires too.  (Or it could even
-    // start firing before the setImmediate handler is called.) But it should be
-    // OK for there to be overlapping rm_recursive calls, since rm_recursive
-    // ignores all ENOENT calls. And we don't remove tempDir from tempDirs until
-    // it's done, so that if mid-way through this rm_recursive the onExit one
-    // fires, it still gets removed.
 
-    try {
-      files.rm_recursive(tempDir);
-    } catch (err) {
-      // Don't crash and print a stack trace because we failed to delete a temp
-      // directory. This happens sometimes on Windows and seems to be
-      // unavoidable.
-      console.log(err);
-    }
-
-    tempDirs = _.without(tempDirs, tempDir);
+  return files.rm_recursive_async(dir).then(() => {
+    // Delete tempDirs[dir] only when the removal finishes, so that the
+    // cleanup.onExit handler can attempt the removal synchronously if it
+    // fires in the meantime.
+    delete tempDirs[dir];
+  }, error => {
+    // Leave tempDirs[dir] in place so the cleanup.onExit handler can try
+    // to delete it again when the process exits.
+    console.log(error);
   });
 };
 
 if (! process.env.METEOR_SAVE_TMPDIRS) {
   cleanup.onExit(function (sig) {
-    _.each(tempDirs, function (tempDir) {
+    Object.keys(tempDirs).forEach(dir => {
+      delete tempDirs[dir];
       try {
-        files.rm_recursive(tempDir);
+        files.rm_recursive(dir);
       } catch (err) {
-        // Don't crash and print a stack trace because we failed to delete a temp
-        // directory. This happens sometimes on Windows and seems to be
-        // unavoidable.
-        console.log(err);
+        // Don't crash and print a stack trace because we failed to delete
+        // a temp directory. This happens sometimes on Windows and seems
+        // to be unavoidable.
       }
     });
-
-    tempDirs = [];
   });
 }
 
 // Takes a buffer containing `.tar.gz` data and extracts the archive
 // into a destination directory. destPath should not exist yet, and
 // the archive should contain a single top-level directory, which will
-// be renamed atomically to destPath. The entire tree will be made
-// readonly.
+// be renamed atomically to destPath.
 files.extractTarGz = function (buffer, destPath, options) {
   var options = options || {};
   var parentDir = files.pathDirname(destPath);
@@ -717,13 +753,10 @@ files.extractTarGz = function (buffer, destPath, options) {
   }
 
   const startTime = +new Date;
-  let promise = tryExtractWithNativeTar(buffer, tempDir, options);
 
-  if (process.platform === "win32") {
-    promise = promise.catch(
-      error => tryExtractWithNative7z(buffer, tempDir, options)
-    );
-  }
+  let promise = process.platform === "win32"
+    ? tryExtractWithNative7z(buffer, tempDir, options)
+    : tryExtractWithNativeTar(buffer, tempDir, options)
 
   promise = promise.catch(
     error => tryExtractWithNpmTar(buffer, tempDir, options)
@@ -743,7 +776,6 @@ files.extractTarGz = function (buffer, destPath, options) {
   }
 
   var extractDir = files.pathJoin(tempDir, topLevelOfArchive[0]);
-  makeTreeReadOnly(extractDir);
   files.rename(extractDir, destPath);
   files.rm_recursive(tempDir);
 
@@ -873,6 +905,14 @@ function tryExtractWithNpmTar(buffer, tempDir, options) {
   });
 }
 
+// In the same fashion as node-pre-gyp does, add the executable
+// bit but only if the read bit was present.  Same as:
+// https://github.com/mapbox/node-pre-gyp/blob/7a28f4b0f562ba4712722fefe4eeffb7b20fbf7a/lib/install.js#L71-L77
+// and others reported in: https://github.com/npm/node-tar/issues/7
+function addExecBitWhenReadBitPresent(fileMode) {
+  return fileMode |= (fileMode >>> 2) & 0o111;
+}
+
 // Tar-gzips a directory, returning a stream that can then be piped as
 // needed.  The tar archive will contain a top-level directory named
 // after dirPath.
@@ -880,6 +920,12 @@ files.createTarGzStream = function (dirPath, options) {
   var tar = require("tar");
   var fstream = require('fstream');
   var zlib = require("zlib");
+
+  // Create a segment of the file path which we will look for to
+  // identify exactly what we think is a "bin" file (that is, something
+  // which should be expected to work within the context of an
+  // 'npm run-script').
+  var binPathMatch = ["", "node_modules", ".bin", ""].join(path.sep);
 
   // Don't use `{ path: dirPath, type: 'Directory' }` as an argument to
   // fstream.Reader. This triggers a collection of odd behaviors in fstream
@@ -920,8 +966,13 @@ files.createTarGzStream = function (dirPath, options) {
       // setting it in an 'entry' handler is the same strategy that npm
       // does, so we do that here too.
       if (entry.type === "Directory") {
-        entry.mode = (entry.mode || entry.props.mode) | 0o500;
-        entry.props.mode = entry.mode;
+        entry.props.mode = addExecBitWhenReadBitPresent(entry.props.mode);
+      }
+
+      // In a similar way as for directories, but only if is in a path
+      // location that is expected to be executable (npm "bin" links)
+      if (entry.type === "File" && entry.path.indexOf(binPathMatch) > -1) {
+        entry.props.mode = addExecBitWhenReadBitPresent(entry.props.mode);
       }
 
       return true;
@@ -934,14 +985,16 @@ files.createTarGzStream = function (dirPath, options) {
 
 // Tar-gzips a directory into a tarball on disk, synchronously.
 // The tar archive will contain a top-level directory named after dirPath.
-files.createTarball = function (dirPath, tarball, options) {
+files.createTarball = Profile(function (dirPath, tarball) {
+  return "files.createTarball " + files.pathBasename(tarball);
+}, function (dirPath, tarball, options) {
   var out = files.createWriteStream(tarball);
   new Promise(function (resolve, reject) {
     out.on('error', reject);
     out.on('close', resolve);
     files.createTarGzStream(dirPath, options).pipe(out);
   }).await();
-};
+});
 
 // Use this if you'd like to replace a directory with another
 // directory as close to atomically as possible. It's better than
@@ -950,45 +1003,74 @@ files.createTarball = function (dirPath, tarball, options) {
 // toDir does not exist" and "you can end up with garbage directories
 // sitting around", but not "there's any time where toDir exists but
 // is in a state other than initial or final".)
-files.renameDirAlmostAtomically = function (fromDir, toDir) {
-  var garbageDir = toDir + '-garbage-' + utils.randomToken();
+files.renameDirAlmostAtomically =
+  Profile("files.renameDirAlmostAtomically", (fromDir, toDir) => {
+    const garbageDir = `${toDir}-garbage-${utils.randomToken()}`;
 
-  // Get old dir out of the way, if it exists.
-  var movedOldDir = true;
-  try {
-    files.rename(toDir, garbageDir);
-  } catch (e) {
-    if (e.code !== 'ENOENT') {
-      throw e;
+    // Get old dir out of the way, if it exists.
+    let cleanupGarbage = false;
+    let forceCopy = false;
+    try {
+      files.rename(toDir, garbageDir);
+      cleanupGarbage = true;
+    } catch (e) {
+      if (e.code === 'EXDEV') {
+        // Some (notably Docker) file systems will fail to do a seemingly
+        // harmless operation, such as renaming, on what is apparently the same
+        // file system.  AUFS will do this even if the `fromDir` and `toDir`
+        // are on the same layer, and OverlayFS will fail if the `fromDir` and
+        // `toDir` are on different layers.  In these cases, we will not be
+        // atomic and will need to do a recursive copy.
+        forceCopy = true;
+      } else if (e.code !== 'ENOENT') {
+        // No such file or directory is okay, but anything else is not.
+        throw e;
+      }
     }
-    movedOldDir = false;
-  }
 
-  // Now rename the directory.
-  files.rename(fromDir, toDir);
+    if (! forceCopy) {
+      try {
+        files.rename(fromDir, toDir);
+      } catch (e) {
+        // It's possible that there may not have been a `toDir` to have
+        // advanced warning about this, so we're prepared to handle it again.
+        if (e.code === 'EXDEV') {
+          forceCopy = true;
+        } else {
+          throw e;
+        }
+      }
+    }
 
-  // ... and delete the old one.
-  if (movedOldDir) {
-    files.rm_recursive(garbageDir);
-  }
-};
-files.renameDirAlmostAtomically = Profile("files.renameDirAlmostAtomically",
-                                          files.renameDirAlmostAtomically);
+    // If we've been forced to jeopardize our atomicity due to file-system
+    // limitations, we'll resort to copying.
+    if (forceCopy) {
+      files.rm_recursive(toDir);
+      files.cp_r(fromDir, toDir, {
+        preserveSymlinks: true,
+      });
+    }
 
-files.writeFileAtomically = function (filename, contents) {
-  const parentDir = files.pathDirname(filename);
-  files.mkdir_p(parentDir);
+    // ... and take out the trash.
+    if (cleanupGarbage) {
+      // We don't care about how long this takes, so we'll let it go async.
+      files.rm_recursive(garbageDir);
+    }
+  });
 
-  const tmpFile = files.pathJoin(
-    parentDir,
-    '.' + files.pathBasename(filename) + '.' + utils.randomToken()
-  );
+files.writeFileAtomically =
+  Profile("files.writeFileAtomically", function (filename, contents) {
+    const parentDir = files.pathDirname(filename);
+    files.mkdir_p(parentDir);
 
-  files.writeFile(tmpFile, contents);
-  files.rename(tmpFile, filename);
-};
-files.writeFileAtomically = Profile("files.writeFileAtomically",
-                                    files.writeFileAtomically);
+    const tmpFile = files.pathJoin(
+      parentDir,
+      '.' + files.pathBasename(filename) + '.' + utils.randomToken()
+    );
+
+    files.writeFile(tmpFile, contents);
+    files.rename(tmpFile, filename);
+  });
 
 // Like fs.symlinkSync, but creates a temporay link and renames it over the
 // file; this means it works even if the file already exists.
@@ -1447,7 +1529,6 @@ files.readLinkToMeteorScript = function (linkLocation, platform) {
 //   A helpful file to import for this purpose is colon-converter.js, which also
 //   knows how to convert various configuration file formats.
 
-
 files.fsFixPath = {};
 /**
  * Wrap a function from node's fs module to use the right slashes for this OS
@@ -1481,7 +1562,6 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
         args[i] = files.convertToOSPath(args[i]);
       }
 
-      const canYield = Fiber.current && Fiber.yield && ! Fiber.yield.disallowed;
       const shouldBeSync = alwaysSync || sync;
       // There's some overhead in awaiting a Promise of an async call,
       // vs just doing the sync call, which for a call like "stat"
@@ -1490,9 +1570,15 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
       // conditions, so we get a nice performance boost from making
       // these calls sync.
       const isQuickie = (fsFuncName === 'stat' ||
-                         fsFuncName === 'rename');
+                         fsFuncName === 'rename' ||
+                         fsFuncName === 'symlink');
 
-      if (canYield && shouldBeSync && !isQuickie) {
+      const dirty = options && options.dirty;
+      const dirtyFn = typeof dirty === "function" ? dirty : null;
+
+      if (mayYield() &&
+          shouldBeSync &&
+          ! isQuickie) {
         const promise = new Promise((resolve, reject) => {
           args.push((err, value) => {
             if (options.noErr) {
@@ -1509,6 +1595,10 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
 
         const result = promise.await();
 
+        if (dirtyFn) {
+          dirtyFn(...args);
+        }
+
         return options.modifyReturnValue
           ? options.modifyReturnValue(result)
           : result;
@@ -1517,6 +1607,11 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
         // Should be sync but can't yield: we are not in a Fiber.
         // Run the sync version of the fs.* method.
         const result = fsFuncSync.apply(fs, args);
+
+        if (dirtyFn) {
+          dirtyFn(...args);
+        }
+
         return options.modifyReturnValue ?
                options.modifyReturnValue(result) : result;
 
@@ -1533,12 +1628,20 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
           args.push((err, res) => {
             err ? reject(err) : resolve(res);
           });
+
           fsFunc.apply(fs, args);
+
         }).then(res => {
+          if (dirtyFn) {
+            dirtyFn(...args);
+          }
+
           if (options.modifyReturnValue) {
             res = options.modifyReturnValue(res);
           }
+
           cb && cb(null, res);
+
         }, cb);
 
         return;
@@ -1559,8 +1662,30 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
     Profile('wrapped.fs.' + fsFuncName + 'Sync', makeWrapper({ sync: true }));
 }
 
-wrapFsFunc("writeFile", [0]);
-wrapFsFunc("appendFile", [0]);
+let dependOnPathSalt = 0;
+export const dependOnPath = require("optimism").wrap(
+  // Always return something different to prevent optimism from
+  // second-guessing the dirtiness of this function.
+  path => ++dependOnPathSalt,
+  // This function is disposable because we don't care about its result,
+  // only its role in optimistic dependency tracking/dirtying.
+  { disposable: true }
+);
+
+function wrapDestructiveFsFunc(name, pathArgIndices) {
+  pathArgIndices = pathArgIndices || [0];
+  wrapFsFunc(name, pathArgIndices, {
+    dirty(...args) {
+      // Immediately reset all optimistic functions (defined in
+      // tools/fs/optimistic.js) that depend on these paths.
+      pathArgIndices.forEach(i => dependOnPath.dirty(args[i]));
+    }
+  });
+}
+
+wrapDestructiveFsFunc("writeFile");
+wrapDestructiveFsFunc("appendFile");
+
 wrapFsFunc("readFile", [0], {
   modifyReturnValue: function (fileData) {
     if (_.isString(fileData)) {
@@ -1570,9 +1695,11 @@ wrapFsFunc("readFile", [0], {
     return fileData;
   }
 });
+
 wrapFsFunc("stat", [0]);
 wrapFsFunc("lstat", [0]);
-wrapFsFunc("rename", [0, 1]);
+
+wrapDestructiveFsFunc("rename", [0, 1]);
 
 // After the outermost files.withCache call returns, the withCacheCache is
 // reset to null so that it does not survive server restarts.
@@ -1645,26 +1772,33 @@ files.existsSync = function (path, callback) {
   return !! files.statOrNull(path);
 };
 
-if (process.platform === "win32") {
-  var rename = files.rename;
+if (files.isWindowsLikeFilesystem()) {
+  const rename = files.rename;
 
   files.rename = function (from, to) {
-    // retries are necessarily only on Windows, because the rename call can fail
-    // with EBUSY, which means the file is "busy"
-    var maxTries = 10;
-    var success = false;
+    // Retries are necessary only on Windows, because the rename call can
+    // fail with EBUSY, which means the file is in use.
+    let maxTries = 10;
+    let success = false;
+    const osTo = files.convertToOSPath(to);
+
     while (! success && maxTries-- > 0) {
       try {
+        // Despite previous failures, the top-level destination directory
+        // may have been successfully created, so we must remove it to
+        // avoid moving the source file *into* the destination directory.
+        rimraf.sync(osTo);
         rename(from, to);
         success = true;
       } catch (err) {
-        if (err.code !== 'EPERM') {
+        if (err.code !== 'EPERM' && err.code !== 'EACCES') {
           throw err;
         }
       }
     }
+
     if (! success) {
-      files.cp_r(from, to);
+      files.cp_r(from, to, { preserveSymlinks: true });
       files.rm_recursive(from);
     }
   };
@@ -1681,10 +1815,11 @@ wrapFsFunc("readdir", [0], {
   }
 });
 
-wrapFsFunc("rmdir", [0]);
-wrapFsFunc("mkdir", [0]);
-wrapFsFunc("unlink", [0]);
-wrapFsFunc("chmod", [0]);
+wrapDestructiveFsFunc("rmdir");
+wrapDestructiveFsFunc("mkdir");
+wrapDestructiveFsFunc("unlink");
+wrapDestructiveFsFunc("chmod");
+
 wrapFsFunc("open", [0]);
 
 // XXX this doesn't give you the second argument to the callback
@@ -1713,17 +1848,6 @@ files.watchFile = function (...args) {
 files.unwatchFile = function (...args) {
   args[0] = files.convertToOSPath(args[0]);
   return fs.unwatchFile(...args);
-};
-
-// wrap pathwatcher because it works with file system paths
-// XXX we don't currently convert the path argument passed to the watch
-//     callback, but we currently don't use the argument either
-files.pathwatcherWatch = function (...args) {
-  args[0] = files.convertToOSPath(args[0]);
-  // don't import pathwatcher until the moment we actually need it
-  // pathwatcher has a record of keeping some global state
-  var pathwatcher = require('pathwatcher');
-  return require("pathwatcher").watch(...args);
 };
 
 files.readBufferWithLengthAndOffset = function (filename, length, offset) {

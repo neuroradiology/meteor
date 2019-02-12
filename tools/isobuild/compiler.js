@@ -14,6 +14,11 @@ var compileStepModule = require('./compiler-deprecated-compile-step.js');
 var Profile = require('../tool-env/profile.js').Profile;
 import { SourceProcessorSet } from './build-plugin.js';
 
+import {
+  optimisticReadFile,
+  optimisticHashOrNull,
+} from "../fs/optimistic.js";
+
 var compiler = exports;
 
 // Whenever you change anything about the code that generates isopacks, bump
@@ -29,11 +34,16 @@ var compiler = exports;
 // dependencies. (At least for now, packages only used in target creation (eg
 // minifiers) don't require you to update BUILT_BY, though you will need to quit
 // and rerun "meteor run".)
-compiler.BUILT_BY = 'meteor/22';
+compiler.BUILT_BY = 'meteor/32';
 
 // This is a list of all possible architectures that a build can target. (Client
 // is expanded into 'web.browser' and 'web.cordova')
-compiler.ALL_ARCHES = [ "os", "web.browser", "web.cordova" ];
+compiler.ALL_ARCHES = [
+  "os",
+  "web.browser",
+  "web.browser.legacy",
+  "web.cordova"
+];
 
 compiler.compile = Profile(function (packageSource, options) {
   return `compiler.compile(${ packageSource.name || 'the app' })`;
@@ -56,9 +66,6 @@ compiler.compile = Profile(function (packageSource, options) {
         "` in package `" + packageSource.name + "`",
       rootPath: packageSource.sourceRoot
     }, function () {
-      // XXX we should probably also pass options.noLineNumbers into
-      //     buildJsImage so it can pass it back to its call to
-      //     compiler.compile
       var buildResult = bundler.buildJsImage({
         name: info.name,
         packageMap: packageMap,
@@ -181,7 +188,6 @@ compiler.compile = Profile(function (packageSource, options) {
         sourceArch: architecture,
         isopackCache: isopackCache,
         nodeModulesPath: nodeModulesPath,
-        noLineNumbers: options.noLineNumbers
       });
 
       _.extend(pluginProviderPackageNames,
@@ -340,8 +346,6 @@ var compileUnibuild = Profile(function (options) {
   const inputSourceArch = options.sourceArch;
   const isopackCache = options.isopackCache;
   const nodeModulesPath = options.nodeModulesPath;
-  const noLineNumbers = options.noLineNumbers;
-
   const isApp = ! inputSourceArch.pkg.name;
   const resources = [];
   const pluginProviderPackageNames = {};
@@ -527,11 +531,14 @@ var compileUnibuild = Profile(function (options) {
       // though; that happens via compiler.lint.
 
       if (isApp) {
-        // This shouldn't happen, because initFromAppDir's getFiles
+        // This shouldn't normally happen, because initFromAppDir's getFiles
         // should only return assets or sources which match
-        // sourceProcessorSet.
-        throw Error("app contains non-asset files without plugin? " +
-                    relPath + " - " + filename);
+        // sourceProcessorSet. That being said, this can happen when sources
+        // are being watched by a build plugin, and that build plugin is
+        // removed while the Tool is running. Given that this is not a
+        // common occurrence however, we'll ignore this situation and let the
+        // Tool rebuild continue.
+        return;
       }
 
       const linterClassification = linterSourceProcessorSet.classifyFilename(
@@ -550,14 +557,19 @@ api.addAssets('${relPath}', 'client').`);
       return;
     }
 
-    // readAndWatchFileWithHash returns an object carrying a buffer with the
-    // file-contents. The buffer contains the original data of the file (no EOL
-    // transforms from the tools/files.js part).
-    const file = watch.readAndWatchFileWithHash(watchSet, absPath);
-    const hash = file.hash;
-    const contents = file.contents;
+    const contents = optimisticReadFile(absPath);
+    const hash = optimisticHashOrNull(absPath);
+    const file = { contents, hash };
+    watchSet.addFile(absPath, hash);
 
     Console.nudge(true);
+
+    if (classification.type === "meteor-ignore") {
+      // Return after watching .meteorignore files but before adding them
+      // as resources to be processed by compiler plugins. To see how
+      // these files are handled, see PackageSource#_findSources.
+      return;
+    }
 
     if (contents === null) {
       // It really sucks to put this check here, since this isn't publish
@@ -762,9 +774,12 @@ function runLinters({inputSourceArch, isopackCache, sources,
         classification.type === 'unmatched') {
       return;
     }
-    // We shouldn't ever add a legacy handler and we're not hardcoding JS for
-    // linters, so we should always have SourceProcessor if anything matches.
-    if (! classification.sourceProcessors) {
+
+    // We shouldn't ever add a legacy handler and we're not hardcoding JS
+    // for linters, so we should always have SourceProcessor if anything
+    // matches, unless this is a .meteorignore file.
+    if (classification.type !== "meteor-ignore" &&
+        ! classification.sourceProcessors) {
       throw Error(
         `Unexpected classification for ${ relPath }: ${ classification.type }`);
     }
@@ -773,6 +788,14 @@ function runLinters({inputSourceArch, isopackCache, sources,
     const {hash, contents} = watch.readAndWatchFileWithHash(
       watchSet,
       files.pathResolve(inputSourceArch.sourceRoot, relPath));
+
+    if (classification.type === "meteor-ignore") {
+      // Return after watching .meteorignore files but before adding them
+      // as resources to be processed by compiler plugins. To see how
+      // these files are handled, see PackageSource#_findSources.
+      return;
+    }
+
     const wrappedSource = {
       relPath, contents, hash, fileOptions,
       arch: inputSourceArch.arch,
@@ -797,7 +820,10 @@ function runLinters({inputSourceArch, isopackCache, sources,
       wrappedSource => new linterPluginModule.LintingFile(wrappedSource)
     );
 
-    const linter = sourceProcessor.userPlugin.processFilesForPackage;
+    const markedLinter = buildmessage.markBoundary(
+      sourceProcessor.userPlugin.processFilesForPackage,
+      sourceProcessor.userPlugin
+    );
 
     function archToString(arch) {
       if (arch.match(/web\.cordova/)) {
@@ -820,9 +846,9 @@ function runLinters({inputSourceArch, isopackCache, sources,
         " (" + archToString(inputSourceArch.arch) + ")"
     }, () => {
       try {
-        var markedLinter = buildmessage.markBoundary(linter.bind(
-          sourceProcessor.userPlugin));
-        markedLinter(sourcesToLint, { globals: globalImports });
+        Promise.await(markedLinter(sourcesToLint, {
+          globals: globalImports
+        }));
       } catch (e) {
         buildmessage.exception(e);
       }
@@ -970,7 +996,7 @@ export function isIsobuildFeaturePackage(packageName) {
 
 // If you update this data structure to add more feature packages, you should
 // update the wiki page here:
-// https://github.com/meteor/meteor/wiki/Isobuild-Feature-Packages
+// https://docs.meteor.com/api/packagejs.html#isobuild-features
 export const KNOWN_ISOBUILD_FEATURE_PACKAGES = {
   // This package directly calls Plugin.registerCompiler. Package authors
   // must explicitly depend on this feature package to use the API.
@@ -1018,5 +1044,14 @@ export const KNOWN_ISOBUILD_FEATURE_PACKAGES = {
   // One scenario is a package depending on a Cordova plugin or version
   // that is only available on npm, which means downloading the plugin is not
   // supported on versions of Cordova below 5.0.0.
-  'isobuild:cordova': ['5.4.0']
+  'isobuild:cordova': ['5.4.0'],
+
+  // This package requires functionality introduced in meteor-tool@1.5.0
+  // to enable dynamic module fetching via import(...).
+  'isobuild:dynamic-import': ['1.5.0'],
+
+  // This package ensures that processFilesFor{Bundle,Target,Package} are
+  // allowed to return a Promise instead of having to await async
+  // compilation using fibers and/or futures.
+  'isobuild:async-plugins': ['1.6.1'],
 };

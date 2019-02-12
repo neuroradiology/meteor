@@ -23,7 +23,11 @@ var packageMapModule = require('../packaging/package-map.js');
 var packageClient = require('../packaging/package-client.js');
 var tropohouse = require('../packaging/tropohouse.js');
 
-import * as cordova from '../cordova';
+import {
+  ensureDevBundleDependencies,
+  newPluginId,
+  splitPluginsAndPackages,
+} from '../cordova/index.js';
 import { updateMeteorToolSymlink } from "../packaging/updater.js";
 
 // For each release (or package), we store a meta-record with its name,
@@ -144,9 +148,11 @@ main.registerCommand({
     projectDir: options.appDir,
     allowIncompatibleUpdate: options['allow-incompatible-update']
   });
+
   main.captureAndExit("=> Errors while initializing project:", function () {
     projectContext.prepareProjectForBuild();
   });
+
   projectContext.packageMapDelta.displayOnConsole();
 });
 
@@ -463,35 +469,18 @@ main.registerCommand({
   } else if (binary) {
     // Normal publish flow. Tell the user nicely.
     Console.warn();
-    Console.warn(
-      "You're not done publishing yet! This package contains binary code and",
-      "must be built on all of Meteor's architectures, including this",
-      "machine's architecture.");
+    Console.warn("This package contains binary code which must be",
+      "compiled on the architecture it will eventually run on.");
     Console.warn();
     Console.info(
-      "You can access Meteor provided build machines, pre-configured to",
-      "support older versions of MacOS and Linux, by running:");
-    _.each(["os.osx.x86_64", "os.linux.x86_64",
-            "os.linux.x86_32", "os.windows.x86_32"],
-      function (a) {
-        Console.info(
-          Console.command("meteor admin get-machine " + a),
-          Console.options({ indent: 2 }));
-    });
-
+      "Meteor 1.4 and higher will automatically compile packages",
+      "with binary dependencies when they are installed, assuming",
+      "the target machine has a basic compiler toolchain.");
     Console.info();
-    Console.info("On each machine, run:");
-    Console.info();
+    Console.info("To see the requirements for this compilation step,",
+      "consult the platform requirements for 'node-gyp':");
     Console.info(
-      Console.command(
-        "meteor publish-for-arch " +
-        packageSource.name + "@" + packageSource.version),
-      Console.options({ indent: 2 }));
-    Console.info();
-    Console.info(
-      "For more information on binary ABIs and consistent builds, see:");
-    Console.info(
-      Console.url("https://github.com/meteor/meteor/wiki/Build-Machines"),
+      Console.url("https://github.com/nodejs/node-gyp"),
       Console.options({ indent: 2 })
     );
     Console.info();
@@ -699,7 +688,18 @@ main.registerCommand({
   maxArgs: 1,
   options: {
     'create-track': { type: Boolean },
-    'from-checkout': { type: Boolean }
+    'from-checkout': { type: Boolean },
+    // Normally the publish-release script will complain if the source of
+    // a core package differs in any way from what was previously
+    // published for the current version of the package. However, if the
+    // package was deliberately republished independently from a Meteor
+    // release, and those changes have not yet been merged to the master
+    // branch, then the complaint may be spurious. If you have verified
+    // that current release contains no meaningful changes (since the
+    // previous official release) to the packages that are being
+    // complained about, then you can pass the --skip-tree-hashing flag to
+    // disable the treeHash check.
+    'skip-tree-hashing': { type: Boolean },
   },
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: false })
 }, function (options) {
@@ -863,7 +863,9 @@ main.registerCommand({
     // Ensure that all packages and their tests are built. (We need to build
     // tests so that we can include their sources in source tarballs.)
     var allPackagesWithTests = projectContext.localCatalog.getAllPackageNames();
-    var allPackages = projectContext.localCatalog.getAllNonTestPackageNames();
+    var allPackages = projectContext.localCatalog.getAllNonTestPackageNames({
+      includeNonCore: false,
+    });
     projectContext.projectConstraintsFile.addConstraints(
       _.map(allPackagesWithTests, function (p) {
         return utils.parsePackageConstraint(p);
@@ -931,9 +933,22 @@ main.registerCommand({
               throw Error("no isopack for " + packageName);
             }
 
-            var existingBuild =
-                  catalog.official.getBuildWithPreciseBuildArchitectures(
-                    oldVersionRecord, isopk.buildArchitectures());
+            const existingBuild =
+              // First try with the non-simplified build architecture
+              // list, which is likely to be something like
+              // os+web.browser+web.browser.legacy+web.cordova:
+              catalog.official.getBuildWithPreciseBuildArchitectures(
+                oldVersionRecord,
+                isopk.buildArchitectures(),
+              ) ||
+              // If that fails, fall back to the simplified architecture
+              // list (e.g. os+web.browser+web.cordova), to match packages
+              // published before the web.browser.legacy architecture was
+              // introduced (in Meteor 1.7).
+              catalog.official.getBuildWithPreciseBuildArchitectures(
+                oldVersionRecord,
+                isopk.buildArchitectures(true),
+              );
 
             var somethingChanged;
 
@@ -945,7 +960,11 @@ main.registerCommand({
               // haven't bumped the version number yet; either way,
               // you should probably bump the version number.
               somethingChanged = true;
-            } else {
+            } else if (! options["skip-tree-hashing"] ||
+                       // Always check the treeHash of the meteor-tool
+                       // package, since it must have been modified if a
+                       // new release is being published.
+                       packageName === "meteor-tool") {
               // Save the isopack, just to get its hash.
               var bundleBuildResult = packageClient.bundleBuild(
                 isopk,
@@ -1119,6 +1138,8 @@ main.registerCommand({
   name: 'list',
   requiresApp: true,
   options: {
+    'tree': { type: Boolean },
+    'weak': { type: Boolean },
     'allow-incompatible-update': { type: Boolean }
   },
   catalogRefresh: new catalog.Refresh.OnceAtStart({ ignoreErrors: true })
@@ -1133,6 +1154,86 @@ main.registerCommand({
   // No need to display the PackageMapDelta here, since we're about to list all
   // of the packages anyway!
 
+  if (options['tree']) {
+    const showWeak = !!options['weak'];
+    // Load package details of all used packages (inc. dependencies)
+    const packageDetails = new Map;
+    projectContext.packageMap.eachPackage(function (name, info) {
+      packageDetails.set(name, projectContext.projectCatalog.getVersion(name, info.version));
+    });
+
+    // Build a set of top level package names
+    const topLevelSet = new Set;
+    projectContext.projectConstraintsFile.eachConstraint(function (constraint) {
+      topLevelSet.add(constraint.package);
+    });
+
+    // Package that should not be expanded (top level or expanded already)
+    const dontExpand = new Set(topLevelSet.values());
+
+    // Recursive function that outputs each package
+    const printPackage = function (packageToPrint, isWeak, indent1, indent2) {
+      const packageName = packageToPrint.packageName;
+      const depsObj = packageToPrint.dependencies || {};
+      let deps = Object.keys(depsObj).sort();
+      // Ignore references to a meteor version or isobuild marker packages
+      deps = deps.filter(dep => {
+        return dep !== 'meteor' && !compiler.isIsobuildFeaturePackage(dep);
+      });
+
+      if (!showWeak) {
+        // Filter out any weakly referenced dependencies
+        deps = deps.filter(dep => {
+          let references = depsObj[dep].references || [];
+          let weakRef = references.length > 0 && references.every(r => r.weak);
+          return !weakRef;
+        });
+      }
+
+      const expandedAlready = (deps.length > 0 && dontExpand.has(packageName));
+      const shouldExpand = (deps.length > 0 && !expandedAlready && !isWeak);
+      if (indent1 !== '') {
+        indent1 += (shouldExpand ? '┬' : '─') + ' ';
+      }
+
+      let suffix = (isWeak ? '[weak]' : '');
+      if (expandedAlready) {
+        suffix += topLevelSet.has(packageName) ? ' (top level)' : ' (expanded above)';
+      }
+
+      Console.info(indent1 + packageName + '@' + packageToPrint.version + suffix);
+      if (shouldExpand) {
+        dontExpand.add(packageName);
+        deps.forEach((dep, index) => {
+          const references = depsObj[dep].references || [];
+          const weakRef = references.length > 0 && references.every(r => r.weak);
+          const last = ((index + 1) === deps.length);
+          const child = packageDetails.get(dep);
+          const newIndent1 = indent2 + (last ? '└─' : '├─');
+          const newIndent2 = indent2 + (last ? '  ' : '│ ');
+          if (child) {
+            printPackage(child, weakRef, newIndent1, newIndent2);
+          } else if (weakRef) {
+            Console.info(newIndent1 + '─ ' + dep + '[weak] package skipped');
+          } else {
+            Console.info(newIndent1 + '─ ' + dep + ' missing?');
+          }
+        });
+      }
+    };
+
+    const topLevelNames = Array.from(topLevelSet.values()).sort();
+    topLevelNames.forEach((dep, index) => {
+      const topLevelPackage = packageDetails.get(dep);
+      if (topLevelPackage) {
+        // Force top level packages to be expanded
+        dontExpand.delete(topLevelPackage.packageName);
+        printPackage(topLevelPackage, false, '', '');
+      }
+    });
+
+    return 0;
+  }
 
   var items = [];
   var newVersionsAvailable = false;
@@ -1641,6 +1742,23 @@ main.registerCommand({
 
     upgradePackageNames = options.args;
   }
+  // We want to use the project's release for constraints even if we are
+  // currently running a newer release (eg if we ran 'meteor update --patch' and
+  // updated to an older patch release).  (If the project has release 'none'
+  // because this is just 'updating packages', this can be null. Also, if we're
+  // running from a checkout this should be null even if the file doesn't say
+  // 'none'.)
+  var releaseRecordForConstraints = null;
+  if (! files.inCheckout() &&
+      projectContext.releaseFile.normalReleaseSpecified()) {
+    releaseRecordForConstraints = catalog.official.getReleaseVersion(
+      projectContext.releaseFile.releaseTrack,
+      projectContext.releaseFile.releaseVersion);
+    if (! releaseRecordForConstraints) {
+      throw Error("unknown release " +
+                  projectContext.releaseFile.displayReleaseName);
+    }
+  }
 
   const upgradePackagesWithoutCordova =
     upgradePackageNames.filter(name => name.split(':')[0] !== 'cordova');
@@ -1672,6 +1790,7 @@ main.registerCommand({
 
   // Try to resolve constraints, allowing the given packages to be upgraded.
   projectContext.reset({
+    releaseForConstraints: releaseRecordForConstraints,
     upgradePackageNames: upgradePackageNames,
     upgradeIndirectDepPatchVersions: upgradeIndirectDepPatchVersions
   });
@@ -1751,8 +1870,10 @@ main.registerCommand({
                    " are available:");
       _.each(nonlatestIndirectDeps, printItem);
       Console.info([
-        "To update one or more of these packages, pass their names to ",
-        "`meteor update`, or just run `meteor update --all-packages`."
+        "These versions may not be compatible with your project.",
+        "To update one or more of these packages to their latest",
+        "compatible versions, pass their names to `meteor update`,",
+        "or just run `meteor update --all-packages`.",
       ].join("\n"));
     }
   }
@@ -1894,34 +2015,39 @@ main.registerCommand({
 
   // Split arguments into Cordova plugins and packages
   const { plugins: pluginsToAdd, packages: packagesToAdd } =
-    cordova.splitPluginsAndPackages(options.args);
+    splitPluginsAndPackages(options.args);
 
   if (!_.isEmpty(pluginsToAdd)) {
-    let plugins = projectContext.cordovaPluginsFile.getPluginVersions();
-    let changed = false;
+    function cordovaPluginAdd() {
+      const plugins = projectContext.cordovaPluginsFile.getPluginVersions();
+      let changed = false;
 
-    for (target of pluginsToAdd) {
-      let [id, version] = target.split('@');
+      for (target of pluginsToAdd) {
+        const { id, version } =
+          require('../cordova/package-id-version-parser.js').parse(target);
+        const newId = newPluginId(id);
 
-      const newId = cordova.newPluginId(id);
-
-      if (!(version && utils.isValidVersion(version, {forCordova: true}))) {
-        Console.error(`${id}: Meteor requires either an exact version \
-(e.g. ${id}@1.0.0), a Git URL with a SHA reference, or a local path.`);
-        exitCode = 1;
-      } else if (newId) {
-        plugins[newId] = version;
-        Console.info(`Added Cordova plugin ${newId}@${version} \
-(plugin has been renamed as part of moving to npm).`);
-        changed = true;
-      } else {
-        plugins[id] = version;
-        Console.info(`Added Cordova plugin ${id}@${version}.`);
-        changed = true;
+        if (!(version && utils.isValidVersion(version, {forCordova: true}))) {
+          Console.error(`${id}: Meteor requires either an exact version \
+  (e.g. ${id}@1.0.0), a Git URL with a SHA reference, or a local path.`);
+          exitCode = 1;
+        } else if (newId) {
+          plugins[newId] = version;
+          Console.info(`Added Cordova plugin ${newId}@${version} \
+  (plugin has been renamed as part of moving to npm).`);
+          changed = true;
+        } else {
+          plugins[id] = version;
+          Console.info(`Added Cordova plugin ${id}@${version}.`);
+          changed = true;
+        }
       }
+
+      changed && projectContext.cordovaPluginsFile.write(plugins);
     }
 
-    changed && projectContext.cordovaPluginsFile.write(plugins);
+    ensureDevBundleDependencies();
+    cordovaPluginAdd();
   }
 
   if (_.isEmpty(packagesToAdd)) {
@@ -2087,34 +2213,39 @@ main.registerCommand({
 
   // Split arguments into Cordova plugins and packages
   const { plugins: pluginsToRemove, packages }  =
-    cordova.splitPluginsAndPackages(options.args);
+    splitPluginsAndPackages(options.args);
 
   if (!_.isEmpty(pluginsToRemove)) {
-    let plugins = projectContext.cordovaPluginsFile.getPluginVersions();
-    let changed = false;
+    function cordovaPluginRemove() {
+      const plugins = projectContext.cordovaPluginsFile.getPluginVersions();
+      let changed = false;
 
-    for (id of pluginsToRemove) {
-      const newId = cordova.newPluginId(id);
+      for (id of pluginsToRemove) {
+        const newId = newPluginId(id);
 
-      if (/@/.test(id)) {
-        Console.error(`${id}: do not specify version constraints.`);
-        exitCode = 1;
-      } else if (_.has(plugins, id)) {
-        delete plugins[id];
-        Console.info(`Removed Cordova plugin ${id}.`);
-        changed = true;
-      } else if (newId && _.has(plugins, newId)) {
-        delete plugins[newId];
-        Console.info(`Removed Cordova plugin ${newId} \
-(plugin has been renamed as part of moving to npm).`);
-        changed = true;
-      } else {
-        Console.error(`Cordova plugin ${id} is not in this project.`);
-        exitCode = 1;
+        if (/@/.test(id)) {
+          Console.error(`${id}: do not specify version constraints.`);
+          exitCode = 1;
+        } else if (_.has(plugins, id)) {
+          delete plugins[id];
+          Console.info(`Removed Cordova plugin ${id}.`);
+          changed = true;
+        } else if (newId && _.has(plugins, newId)) {
+          delete plugins[newId];
+          Console.info(`Removed Cordova plugin ${newId} \
+  (plugin has been renamed as part of moving to npm).`);
+          changed = true;
+        } else {
+          Console.error(`Cordova plugin ${id} is not in this project.`);
+          exitCode = 1;
+        }
       }
+
+      changed && projectContext.cordovaPluginsFile.write(plugins);
     }
 
-    changed && projectContext.cordovaPluginsFile.write(plugins);
+    ensureDevBundleDependencies();
+    cordovaPluginRemove();
   }
 
   if (_.isEmpty(packages)) {
@@ -2613,7 +2744,7 @@ main.registerCommand({
   try {
     Console.rawInfo(
         "Changing homepage on "
-          + name + " to " + url + "...");
+          + name + " to " + url + "...\n");
       packageClient.callPackageServer(conn,
           '_changePackageHomepage', name, url);
       Console.info(" done");
@@ -2666,7 +2797,7 @@ main.registerCommand({
     _.each(versions, function (version) {
       Console.rawInfo(
         "Setting " + name + "@" + version + " as " +
-         status + " migrated ... ");
+         status + " migrated ...\n");
       packageClient.callPackageServer(
         conn,
         '_changeVersionMigrationStatus',

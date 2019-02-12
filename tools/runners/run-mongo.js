@@ -6,13 +6,15 @@ var runLog = require('./run-log.js');
 var child_process = require('child_process');
 
 var _ = require('underscore');
-var isopackets = require('../tool-env/isopackets.js');
+import { loadIsopackage } from '../tool-env/isopackets.js';
 var Console = require('../console/console.js').Console;
 
 // Given a Mongo URL, open an interative Mongo shell on this terminal
 // on that database.
 var runMongoShell = function (url) {
-  var mongoPath = files.pathJoin(files.getDevBundle(), 'mongodb', 'bin', 'mongo');
+  var mongoPath = files.pathJoin(
+    files.getDevBundle(), 'mongodb', 'bin', 'mongo'
+  );
   // XXX mongo URLs are not real URLs (notably, the comma-separation for
   // multiple hosts). We've had a little better luck using the mongodb-uri npm
   // package.
@@ -20,7 +22,7 @@ var runMongoShell = function (url) {
   var auth = mongoUrl.auth && mongoUrl.auth.split(':');
   var ssl = require('querystring').parse(mongoUrl.query).ssl === "true";
 
-  var args = [];
+  var args = ['--quiet'];
   if (ssl) {
     args.push('--ssl');
   }
@@ -46,22 +48,19 @@ function spawnMongod(mongodPath, port, dbPath, replSetName) {
   const args = [
     // nb: cli-test.sh and findMongoPids make strong assumptions about the
     // order of the arguments! Check them before changing any arguments.
-    '--bind_ip', '127.0.0.1',
+    '--bind_ip', (process.env.METEOR_MONGO_BIND_IP || '127.0.0.1'),
     '--port', port,
     '--dbpath', dbPath,
     // Use an 8MB oplog rather than 256MB. Uses less space on disk and
     // initializes faster. (Not recommended for production!)
     '--oplogSize', '8',
-    '--replSet', replSetName
+    '--replSet', replSetName,
+    '--noauth'
   ];
 
   // Use mmapv1 on 32bit platforms, as our binary doesn't support WT
-  if (process.platform === "win32"
-      || (process.platform === "linux" && process.arch === "ia32")) {
+  if (process.arch === 'ia32') {
     args.push('--storageEngine', 'mmapv1', '--smallfiles');
-  } else {
-    // The WT journal seems to be at least 300MB, which is just too much
-    args.push('--nojournal');
   }
 
   return child_process.spawn(mongodPath, args, {
@@ -285,7 +284,7 @@ if (process.platform === 'win32') {
         resolve(mongoPort);
       });
       client.on('error', () => resolve(null));
-    }).await();
+    }).catch(() => null).await();
   }
 }
 
@@ -361,7 +360,8 @@ var launchMongo = function (options) {
 
   var noOplog = false;
   var mongod_path = files.pathJoin(
-    files.getDevBundle(), 'mongodb', 'bin', 'mongod');
+    files.getDevBundle(), 'mongodb', 'bin', 'mongod'
+  );
   var replSetName = 'meteor';
 
   // Automated testing: If this is set, instead of starting mongod, we
@@ -482,15 +482,15 @@ var launchMongo = function (options) {
 
     proc = spawnMongod(mongod_path, port, dbPath, replSetName);
 
-    subHandles.push({
-      stop: function () {
-        if (proc) {
-          proc.removeListener('exit', procExitHandler);
-          proc.kill('SIGINT');
-          proc = null;
-        }
+    function stop() {
+      if (proc) {
+        proc.removeListener('exit', procExitHandler);
+        proc.kill('SIGINT');
+        proc = null;
       }
-    });
+    }
+    require("../tool-env/cleanup.js").onExit(stop);
+    subHandles.push({ stop });
 
     var procExitHandler = fiberHelpers.bindEnvironment(function (code, signal) {
       // Defang subHandle.stop().
@@ -532,17 +532,18 @@ var launchMongo = function (options) {
     var stdoutOnData = fiberHelpers.bindEnvironment(function (data) {
       // note: don't use "else ifs" in this, because 'data' can have multiple
       // lines
-      if (/\[initandlisten\] Did not find local replica set configuration document at startup/.test(data)) {
+      if (/\[initandlisten\] Did not find local replica set configuration document at startup/.test(data) ||
+          /\[.*\] Locally stored replica set configuration does not have a valid entry for the current node/.test(data)) {
         replSetReadyToBeInitiated = true;
         maybeReadyToTalk();
       }
 
-      if (/ \[initandlisten\] waiting for connections on port/.test(data)) {
+      if (/ \[.*\] waiting for connections on port/.test(data)) {
         listening = true;
         maybeReadyToTalk();
       }
 
-      if (/ \[rsSync\] transition to primary complete/.test(data)) {
+      if (/ \[rsSync-0\] transition to primary complete/.test(data)) {
         replSetReady = true;
         maybeReadyToTalk();
       }
@@ -584,22 +585,47 @@ var launchMongo = function (options) {
   var initiateReplSetAndWaitForReady = function () {
     try {
       // Load mongo so we'll be able to talk to it.
-      var mongoNpmModule =
-            isopackets.load('mongo')['npm-mongo'].NpmModuleMongodb;
+      const {
+        MongoClient,
+        Server
+      } = loadIsopackage('npm-mongo').NpmModuleMongodb;
 
       // Connect to the intended primary and start a replset.
-      var db = new mongoNpmModule.Db(
-        'meteor',
-        new mongoNpmModule.Server('127.0.0.1', options.port, {poolSize: 1}),
-        {safe: true});
-      yieldingMethod(db, 'open');
+      const client = new MongoClient(
+        new Server('127.0.0.1', options.port, {
+          poolSize: 1,
+          socketOptions: {
+            connectTimeoutMS: 60000
+          }
+        })
+      );
+
+      yieldingMethod(client, 'connect');
+      const db = client.db('meteor');
+
       if (stopped) {
         return;
       }
+
       var configuration = {
         _id: replSetName,
+        version: 1,
+        protocolVersion: 1,
         members: [{_id: 0, host: '127.0.0.1:' + options.port, priority: 100}]
       };
+
+      try {
+        const config = yieldingMethod(db.admin(), "command", {
+          replSetGetConfig: 1,
+        }).config;
+
+        // If a replication set configuration already exists, it's
+        // important that the new version number is greater than the old.
+        if (config && _.has(config, "version")) {
+          configuration.version = config.version + 1;
+        }
+      } catch (e) {}
+
       if (options.multiple) {
         // Add two more members: one of which should start as secondary but
         // could in theory become primary, and one of which can never be
@@ -613,10 +639,16 @@ var launchMongo = function (options) {
       }
 
       try {
-        var initiateResult = yieldingMethod(
-          db.admin(), 'command', {replSetInitiate: configuration});
+        yieldingMethod(db.admin(), 'command', {
+          replSetInitiate: configuration,
+        });
       } catch (e) {
-        if (e.message !== 'already initialized') {
+        if (e.message === 'already initialized') {
+          yieldingMethod(db.admin(), 'command', {
+            replSetReconfig: configuration,
+            force: true,
+          });
+        } else {
           throw Error("rs.initiate error: " + e.message);
         }
       }
@@ -624,6 +656,8 @@ var launchMongo = function (options) {
       if (stopped) {
         return;
       }
+
+      let wasJustSecondary = false;
 
       // XXX timeout eventually?
       while (!stopped) {
@@ -643,15 +677,30 @@ var launchMongo = function (options) {
           continue;
         }
 
+        const firstMemberState = status.members[0].stateStr;
+
         // Is the intended primary currently a secondary? (It passes through
         // that phase briefly.)
-        if (status.members[0].stateStr === 'SECONDARY') {
+        if (firstMemberState === 'SECONDARY') {
           utils.sleepMs(20);
+          wasJustSecondary = true;
+          continue;
+        }
+
+        // Mongo 3.2 introduced a new heartbeatIntervalMillis property
+        // on replica sets, used during "primary" negotiation.
+        //
+        // If the first member was _just_ promoted, we'll wait until
+        // the heartbeat interval has elapsed before proceeding since
+        // the decision is not official until the heartbeat has elapsed.
+        if (firstMemberState === 'PRIMARY' && wasJustSecondary) {
+          wasJustSecondary = false;
+          utils.sleepMs(status.heartbeatIntervalMillis);
           continue;
         }
 
         // Anything else for the intended primary is probably an error.
-        if (status.members[0].stateStr !== 'PRIMARY') {
+        if (firstMemberState !== 'PRIMARY') {
           throw Error("Unexpected Mongo status: " + JSON.stringify(status));
         }
 
@@ -666,7 +715,7 @@ var launchMongo = function (options) {
         break;
       }
 
-      db.close(true /* means "the app is closing the connection" */);
+      client.close(true /* means "the app is closing the connection" */);
     } catch (e) {
       // If the process has exited, we're doing another form of error
       // handling. No need to throw random low-level errors farther.

@@ -15,6 +15,8 @@ var projectContextModule = require('../project-context.js');
 var catalog = require('../packaging/catalog/catalog.js');
 var buildmessage = require('../utils/buildmessage.js');
 var httpHelpers = require('../utils/http-helpers.js');
+const archinfo = require('../utils/archinfo.js');
+import { isEmacs } from "../utils/utils.js";
 
 var main = exports;
 
@@ -292,6 +294,28 @@ require('./commands-cordova.js');
 require('./commands-aliases.js');
 
 ///////////////////////////////////////////////////////////////////////////////
+// Record all the top-level commands as JSON
+///////////////////////////////////////////////////////////////////////////////
+
+export const meteorCommandsJsonPath = files.pathJoin(
+  files.getDevBundle(), "bin", ".meteor-commands.json"
+);
+
+export function dumpMeteorCommands() {
+  const all = Object.create(null);
+  Object.keys(commands).forEach(name => all[name] = true);
+  const json = JSON.stringify(all, null, 2);
+  files.writeFile(meteorCommandsJsonPath, json + "\n");
+  return all;
+}
+
+if (files.inCheckout()) {
+  // If we're running Meteor from a checkout, dump the commands every
+  // time, so that the file remains up to date.
+  dumpMeteorCommands();
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Long-form help
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -403,44 +427,44 @@ var springboard = function (rel, options) {
     console.log("WILL SPRINGBOARD TO", rel.getToolsPackageAtVersion());
   }
 
-  var archinfo = require('../utils/archinfo.js');
-  var isopack = require('../isobuild/isopack.js');
+  const toolsPkg = rel.getToolsPackage();
+  const toolsVersion = rel.getToolsVersion();
+  const serverArchitectures = catalog.official.filterArchesWithBuilds(
+    toolsPkg,
+    toolsVersion,
+    archinfo.acceptableMeteorToolArches(),
+  );
 
-  var toolsPkg = rel.getToolsPackage();
-  var toolsVersion = rel.getToolsVersion();
-  var packageMapModule = require('../packaging/package-map.js');
-  var versionMap = {};
-  versionMap[toolsPkg] = toolsVersion;
-  var packageMap = new packageMapModule.PackageMap(versionMap);
+  if (serverArchitectures.length === 0) {
+    var release = catalog.official.getDefaultReleaseVersion();
+    var releaseName = release.track + "@" + release.version;
 
-  if (process.platform === "win32") {
-    // Make sure the tool we are trying to download has been built for Windows
-    var buildsForHostArch = catalog.official.getBuildsForArches(
-      rel.getToolsPackage(), rel.getToolsVersion(), [archinfo.host()]);
+    Console.error(
+      "This project uses " + rel.getDisplayName() + ", which isn't",
+      "available on this platform. To work with this app on all supported",
+      "platforms, use", Console.command("meteor update --release " + releaseName),
+      "to pin this app to the newest compatible release."
+    );
 
-    if (! buildsForHostArch) {
-      var release = catalog.official.getDefaultReleaseVersion();
-      var releaseName = release.track + "@" + release.version;
-
-      Console.error(
-        "This project uses " + rel.getDisplayName() + ", which isn't",
-        "available on Windows. To work with this app on all supported",
-        "platforms, use", Console.command("meteor update --release " + releaseName),
-        "to pin this app to the newest Windows-compatible release.");
-
-      process.exit(1);
-    }
+    process.exit(1);
   }
+
+  const packageMapModule = require('../packaging/package-map.js');
+  const packageMap = new packageMapModule.PackageMap({
+    [toolsPkg]: toolsVersion,
+  });
 
   // XXX split better
   Console.withProgressDisplayVisible(function () {
-    var messages = buildmessage.capture(
-      { title: "downloading the command-line tool" }, function () {
-        catalog.runAndRetryWithRefreshIfHelpful(function () {
-          tropohouse.default.downloadPackagesMissingFromMap(packageMap);
+    var messages = buildmessage.capture({
+      title: "downloading the command-line tool"
+    }, function () {
+      catalog.runAndRetryWithRefreshIfHelpful(function () {
+        tropohouse.default.downloadPackagesMissingFromMap(packageMap, {
+          serverArchitectures,
         });
-      }
-    );
+      });
+    });
 
     if (messages.hasMessages()) {
       // We have failed to download the tool that we are supposed to springboard
@@ -460,20 +484,52 @@ var springboard = function (rel, options) {
     }
   });
 
-  var packagePath = tropohouse.default.packagePath(toolsPkg, toolsVersion);
-  var toolIsopack = new isopack.Isopack;
+  const isopack = require('../isobuild/isopack.js');
+  const packagePath = tropohouse.default.packagePath(toolsPkg, toolsVersion);
+  const toolIsopack = new isopack.Isopack;
   toolIsopack.initFromPath(toolsPkg, packagePath);
-  var toolRecord = _.findWhere(toolIsopack.toolsOnDisk,
-                               {arch: archinfo.host()});
+
+  let toolRecord = null;
+  serverArchitectures.some(arch => {
+    return toolRecord = _.findWhere(toolIsopack.toolsOnDisk, { arch });
+  });
+
   if (!toolRecord) {
     throw Error("missing tool for " + archinfo.host() + " in " +
                 toolsPkg + "@" + toolsVersion);
   }
-  var executable = files.pathJoin(packagePath, toolRecord.path, 'meteor');
+
+  const newToolsDir = files.pathJoin(packagePath, toolRecord.path);
+  if (files.realpath(newToolsDir) ===
+      files.realpath(files.getCurrentToolsDir())) {
+    if (options.mayReturn) {
+      // Return instead of springboarding, if we are allowed to keep using
+      // the current tools without restarting the process.
+      return;
+    }
+  }
+
+  const executable = files.pathJoin(newToolsDir, "meteor");
 
   // Strip off the "node" and "meteor.js" from argv and replace it with the
   // appropriate tools's meteor shell script.
-  var newArgv = process.argv.slice(2);
+  var newArgv = [];
+  const argc = process.argv.length;
+  for (var i = 2; i < argc; ++i) {
+    const arg = process.argv[i];
+    if (arg === "--unsafe-perm" ||
+        arg === "--allow-superuser") {
+      // Don't pass the --unsafe-perm or --allow-superuser flags to
+      // springboarded versions since they may not know how to use them,
+      // but set the METEOR_ALLOW_SUPERUSER environment variable in case
+      // the springboarded version needs it. See meteor/meteor#7959.
+      if (! _.has(process.env, "METEOR_ALLOW_SUPERUSER")) {
+        process.env.METEOR_ALLOW_SUPERUSER = "true";
+      }
+      continue;
+    }
+    newArgv.push(arg);
+  }
 
   if (_.has(options, 'releaseOverride')) {
     // We used to just append --release=<releaseOverride> to the arguments, and
@@ -483,6 +539,10 @@ var springboard = function (rel, options) {
     process.env['METEOR_SPRINGBOARD_RELEASE'] = options.releaseOverride;
   }
 
+  // Release our connection to the sqlite catalog database for the current
+  // process, so that the springboarded process can reestablish it.
+  catalog.official.closePermanently();
+
   if (process.platform === 'win32') {
     process.exit(new Promise(function (resolve) {
       var batPath = files.convertToOSPath(executable + ".bat");
@@ -491,14 +551,6 @@ var springboard = function (rel, options) {
         stdio: 'inherit'
       }).on('exit', resolve);
     }).await());
-  }
-
-  // On OSX, there is a bug in node 4 when launching out to a node 0.10 process
-  // This should be fixed in the next release of node (we should then revert
-  // this change) https://github.com/meteor/meteor/issues/7491
-  if (process.platform === 'darwin') {
-    newArgv.unshift('-q', '/dev/null', executable);
-    executable = 'script';
   }
 
   // Now exec; we're not coming back.
@@ -513,6 +565,10 @@ var oldSpringboard = function (toolsVersion) {
   var newArgv = process.argv.slice(2);
   var cmd =
     files.pathJoin(warehouse.getToolsDir(toolsVersion), 'bin', 'meteor');
+
+  // Release our connection to the sqlite catalog database for the current
+  // process, so that the springboarded process can reestablish it.
+  catalog.official.closePermanently();
 
   // Now exec; we're not coming back.
   require('kexec')(cmd, newArgv);
@@ -536,7 +592,7 @@ Fiber(function () {
   // reversing node's normal setting of O_NONBLOCK on the evaluation
   // of process.stdin (because Node unblocks stdio when forking). This
   // fixes execution of Mongo from within Emacs shell.
-  if (process.env.EMACS == "t") {
+  if (isEmacs()) {
     process.stdin;
     var child_process = require('child_process');
     child_process.spawn('true', [], {stdio: 'inherit'});
@@ -544,7 +600,7 @@ Fiber(function () {
 
   // Check required Node version.
   // This code is duplicated in tools/server/boot.js.
-  var MIN_NODE_VERSION = 'v0.10.41';
+  var MIN_NODE_VERSION = 'v8.0.0';
   if (require('semver').lt(process.version, MIN_NODE_VERSION)) {
     Console.error(
       'Meteor requires Node ' + MIN_NODE_VERSION + ' or later.');
@@ -563,7 +619,7 @@ Fiber(function () {
   // meteor package, and that'll look a lot uglier.
   if (process.env.ROOT_URL) {
     var parsedUrl = require('url').parse(process.env.ROOT_URL);
-    if (!parsedUrl.host) {
+    if (!parsedUrl.host || ['http:', 'https:'].indexOf(parsedUrl.protocol) === -1) {
       Console.error('$ROOT_URL, if specified, must be an URL.');
       process.exit(1);
     }
@@ -602,7 +658,14 @@ Fiber(function () {
   // tight timetable for 1.0 and there is no advantage to doing it now
   // rather than later. #ImprovingCrossVersionOptionParsing
 
-  var isBoolean = { "--help": true };
+  const implicitValues = Object.create(null);
+
+  var isBoolean = {
+    "--help": true,
+    "--unsafe-perm": true,
+    "--allow-superuser": true,
+  };
+
   var walkCommands = function (node) {
     _.each(node, function (value, key) {
       if (value instanceof Command) {
@@ -612,6 +675,9 @@ Fiber(function () {
             names.push("-" + optionInfo.short);
           }
           _.each(names, function (name) {
+            if (_.has(optionInfo, "implicitValue")) {
+              implicitValues[name] = optionInfo.implicitValue;
+            }
             var optionIsBoolean = (optionInfo.type === Boolean);
             if (_.has(isBoolean, name)) {
               if (isBoolean[name] !== optionIsBoolean)  {
@@ -692,6 +758,8 @@ Fiber(function () {
       } else if (value !== undefined) {
         // Handle '--foo=bar' and '--foo=' (which means "set to empty string").
         rawOptions[term].push(value);
+      } else if (_.has(implicitValues, term)) {
+        rawOptions[term].push(implicitValues[term]);
       } else if (i === argv.length - 1) {
         rawOptions[term].push(null);
       } else {
@@ -752,6 +820,45 @@ Fiber(function () {
 
     // It is a plain old argument!
     rawArgs.push(term);
+  }
+
+  if (_.has(rawOptions, "--allow-superuser") ||
+      _.has(rawOptions, "--unsafe-perm")) {
+    process.env.METEOR_ALLOW_SUPERUSER = "true";
+    delete rawOptions["--allow-superuser"];
+    delete rawOptions["--unsafe-perm"];
+  }
+
+  // Prevent running meteor as root on UNIX platforms.
+  if (process.getuid &&
+      process.getuid() === 0) {
+    const allowSuperuser = !! (
+      process.env.METEOR_ALLOW_SUPERUSER &&
+      JSON.parse(process.env.METEOR_ALLOW_SUPERUSER));
+
+    if (! allowSuperuser) {
+      // Meteor is running as root without METEOR_ALLOW_SUPERUSER, notice and stop.
+      Console.error("");
+      Console.error(
+        "You are attempting to run Meteor as the 'root' superuser.",
+        "If you are developing, this is almost certainly *not* what you want to do and will likely result in incorrect file permissions.",
+        "However, if you are running this command in a build process (CI, etc.), or you are absolutely sure you know what you are doing,",
+        "set the METEOR_ALLOW_SUPERUSER environment variable or pass --allow-superuser to proceed."
+      );
+    }
+
+    Console.info("");
+    Console.info(
+      "Even with METEOR_ALLOW_SUPERUSER or --allow-superuser, permissions in your app directory will be incorrect if you ever attempt to perform any Meteor tasks as a normal user.",
+      "If you need to fix your permissions, run the following command from the root of your project:"
+    );
+    Console.info("");
+    Console.info(Console.command("  sudo chown -Rh <username> .meteor/local"));
+    Console.info("");
+
+    if (! allowSuperuser) {
+      process.exit(1);
+    }
   }
 
   // Figure out if we're running in a directory that is part of a Meteor
@@ -1048,10 +1155,23 @@ Fiber(function () {
   // update, because the correct tools version will have been chosen
   // the first time around. It will also never happen if the current
   // release is a checkout, because that doesn't make any sense.
-  if (release.current && release.current.isProperRelease() &&
-      release.current.getToolsPackageAtVersion() !== files.getToolsVersion()) {
-    springboard(release.current, { fromApp: releaseFromApp });
-    // Does not return!
+  if (release.current &&
+      release.current.isProperRelease()) {
+    if (files.getToolsVersion() !==
+        release.current.getToolsPackageAtVersion()) {
+      springboard(release.current, {
+        fromApp: releaseFromApp,
+        mayReturn: false,
+      })
+      // Does not return!
+    } else if (archinfo.canSwitchTo64Bit()) {
+      springboard(release.current, {
+        fromApp: releaseFromApp,
+        // Switching to a 64-bit meteor-tool build may fail, in which case
+        // we should continue on as usual.
+        mayReturn: true,
+      });
+    }
   }
 
   // Check for the '--help' option.
@@ -1407,7 +1527,10 @@ Fiber(function () {
       });
     }
 
-    var ret = command.func(options, {rawOptions});
+    var ret = Promise.resolve(
+      command.func(options, { rawOptions })
+    ).await();
+
   } catch (e) {
     Console.enableProgressDisplay(false);
 

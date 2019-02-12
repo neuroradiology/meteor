@@ -222,6 +222,14 @@ exports.randomToken = function () {
   return (Math.random() * 0x100000000 + 1).toString(36);
 };
 
+// Like utils.randomToken, except a legal variable name, i.e. the first
+// character is guaranteed to be [a-z] and the rest [a-z0-9].
+exports.randomIdentifier = function () {
+  const firstLetter = String.fromCharCode(
+    "a".charCodeAt(0) + Math.floor(Math.random() * 26));
+  return firstLetter + Math.random().toString(36).slice(2);
+};
+
 // Returns a random non-privileged port number.
 exports.randomPort = function () {
   return 20000 + Math.floor(Math.random() * 10000);
@@ -490,7 +498,8 @@ exports.isUrlWithSha = function (x) {
 exports.isNpmUrl = function (x) {
   // These are the various protocols that NPM supports, which we use to download NPM dependencies
   // See https://docs.npmjs.com/files/package.json#git-urls-as-dependencies
-  return exports.isUrlWithSha(x) || /^(git|git\+ssh|git\+http|git\+https)?:\/\//.test(x);
+  return exports.isUrlWithSha(x) ||
+    /^(git|git\+ssh|git\+http|git\+https|https|http)?:\/\//.test(x);
 };
 
 exports.isPathRelative = function (x) {
@@ -523,7 +532,7 @@ exports.isValidVersion = function (version, {forCordova}) {
 
 exports.execFileSync = function (file, args, opts) {
   var child_process = require('child_process');
-  var eachline = require('eachline');
+  var { eachline } = require('./eachline.js');
 
   opts = opts || {};
   if (! _.has(opts, 'maxBuffer')) {
@@ -533,13 +542,13 @@ exports.execFileSync = function (file, args, opts) {
   if (opts && opts.pipeOutput) {
     var p = child_process.spawn(file, args, opts);
 
-    eachline(p.stdout, fiberHelpers.bindEnvironment(function (line) {
+    eachline(p.stdout, function (line) {
       process.stdout.write(line + '\n');
-    }));
+    });
 
-    eachline(p.stderr, fiberHelpers.bindEnvironment(function (line) {
+    eachline(p.stderr, function (line) {
       process.stderr.write(line + '\n');
-    }));
+    });
 
     return {
       success: ! new Promise(function (resolve) {
@@ -564,18 +573,18 @@ exports.execFileSync = function (file, args, opts) {
 exports.execFileAsync = function (file, args, opts) {
   opts = opts || {};
   var child_process = require('child_process');
-  var eachline = require('eachline');
+  var { eachline } = require('./eachline.js');
   var p = child_process.spawn(file, args, opts);
   var mapper = opts.lineMapper || _.identity;
 
-  var logOutput = fiberHelpers.bindEnvironment(function (line) {
+  function logOutput(line) {
     if (opts.verbose) {
       line = mapper(line);
       if (line) {
         console.log(line);
       }
     }
-  });
+  }
 
   eachline(p.stdout, logOutput);
   eachline(p.stderr, logOutput);
@@ -683,3 +692,59 @@ exports.sourceMapLength = function (sm) {
          return soFar + (current ? current.length : 0);
        }, 0);
 };
+
+// Find and return the current OS architecture, in "uname -m" format.
+//
+// For Linux and macOS (Darwin) this means first getting the current
+// architecture reported by Node using "os.arch()" (e.g. ia32, x64), then
+// converting it to a "uname -m" matching architecture label (e.g. i686,
+// x86_64).
+//
+// For Windows things are handled differently. Node's "os.arch()" will return
+// "ia32" for both 32-bit and 64-bit versions of Windows (since we're using
+// a 32-bit version of Node on Windows). Instead we'll look for the presence
+// of the PROCESSOR_ARCHITEW6432 environment variable to determine if the
+// Windows architecture is 64-bit, then convert to a "uname -m" matching
+// architecture label (e.g. i386, x86_64).
+export function architecture() {
+  const supportedArchitectures = {
+    Darwin: {
+      x64: 'x86_64',
+    },
+    Linux: {
+      ia32: 'i686',
+      x64: 'x86_64',
+    },
+    Windows_NT: {
+      ia32: process.env.hasOwnProperty('PROCESSOR_ARCHITEW6432')
+              ? 'x86_64'
+              : 'i386',
+      x64: 'x86_64'
+    }
+  };
+
+  const osType = os.type();
+  const osArch = os.arch();
+
+  if (!supportedArchitectures[osType]) {
+    throw new Error(`Unsupported OS ${osType}`);
+  }
+
+  if (!supportedArchitectures[osType][osArch]) {
+    throw new Error(`Unsupported architecture ${osArch}`);
+  }
+
+  return supportedArchitectures[osType][osArch];
+};
+
+let emacsDetected;
+export function isEmacs() {
+  // Checking `process.env` is expensive, so only check once.
+  if (typeof emacsDetected === "boolean") {
+    return emacsDetected;
+  }
+
+  // Prior to v22, Emacs only set EMACS. After v27, it only sets INSIDE_EMACS.
+  emacsDetected = !! (process.env.EMACS === "t" || process.env.INSIDE_EMACS);
+  return emacsDetected;
+}

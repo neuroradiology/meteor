@@ -52,7 +52,9 @@ function getDevBundleDir() {
     return defaultDevBundlePromise;
   }
 
-  return getDevBundleForRelease(release).then(function (devBundleDir) {
+  return Promise.resolve(
+    getDevBundleForRelease(release)
+  ).then(function (devBundleDir) {
     if (devBundleDir) {
       links.makeLink(devBundleDir, devBundleLink);
       return devBundleDir;
@@ -187,6 +189,9 @@ function makeStatTest(method) {
 
 function getHostArch() {
   if (process.platform === "win32") {
+    if (process.arch === "x64") {
+      return "os.windows.x86_64";
+    }
     return "os.windows.x86_32";
   }
 

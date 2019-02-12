@@ -8,6 +8,7 @@ var watch = require('../fs/watch.js');
 var colonConverter = require('../utils/colon-converter.js');
 var Profile = require('../tool-env/profile.js').Profile;
 var archinfo = require('../utils/archinfo.js');
+import { requestGarbageCollection } from "../utils/gc.js";
 
 export class IsopackCache {
   constructor(options) {
@@ -50,8 +51,6 @@ export class IsopackCache {
     // Map from package name to Isopack.
     self._isopacks = Object.create(null);
 
-    self._noLineNumbers = !! options.noLineNumbers;
-
     self._lintLocalPackages = !! options.lintLocalPackages;
     self._lintPackageWithSourceRoot = options.lintPackageWithSourceRoot;
 
@@ -74,6 +73,7 @@ export class IsopackCache {
     } else {
       self._packageMap.eachPackage(function (name, packageInfo) {
         self._ensurePackageLoaded(name, onStack);
+        requestGarbageCollection();
       });
     }
   }
@@ -134,7 +134,7 @@ export class IsopackCache {
           packageInfo.version
         );
 
-        return files.realpath(files.pathJoin(isopackPath, arch));
+        return files.pathJoin(isopackPath, arch);
       }
     }
 
@@ -151,20 +151,17 @@ export class IsopackCache {
       return true;
     }
 
-    arch = arch && archinfo.withoutSpecificOs(arch);
+    const unibuild = isopack.getUnibuildAtArch(arch);
+    if (! unibuild) {
+      return false;
+    }
 
-    return _.some(isopack.unibuilds, u => {
-      if (arch && ! archinfo.matches(u.arch, arch)) {
-        return false;
-      }
-
-      return _.some(u.uses, use => {
-        return this.implies(
-          this._isopacks[use.package],
-          name,
-          arch,
-        );
-      });
+    return _.some(unibuild.uses, use => {
+      return this.implies(
+        this._isopacks[use.package],
+        name,
+        arch,
+      );
     });
   }
 
@@ -178,20 +175,17 @@ export class IsopackCache {
       return true;
     }
 
-    arch = arch && archinfo.withoutSpecificOs(arch);
+    const unibuild = isopack.getUnibuildAtArch(arch);
+    if (! unibuild) {
+      return false;
+    }
 
-    return _.some(isopack.unibuilds, u => {
-      if (arch && ! archinfo.matches(u.arch, arch)) {
-        return false;
-      }
-
-      return _.some(u.implies, imp => {
-        return this.implies(
-          this._isopacks[imp.package],
-          name,
-          arch,
-        );
-      });
+    return _.some(unibuild.implies, imp => {
+      return this.implies(
+        this._isopacks[imp.package],
+        name,
+        arch,
+      );
     });
   }
 
@@ -360,7 +354,6 @@ export class IsopackCache {
           isopack = compiler.compile(packageInfo.packageSource, {
             packageMap: self._packageMap,
             isopackCache: self,
-            noLineNumbers: self._noLineNumbers,
             includeCordovaUnibuild: self._includeCordovaUnibuild,
             includePluginProviderPackageMap: true,
             pluginCacheDir: pluginCacheDir
@@ -381,6 +374,8 @@ export class IsopackCache {
               });
             }
           }
+
+          requestGarbageCollection();
         }
       }
 
@@ -538,3 +533,14 @@ export class IsopackCache {
     return messages;
   }
 }
+
+const ICp = IsopackCache.prototype;
+[ // Include any methods here that need profiling and take a package name
+  // string as their first argument.
+  "_ensurePackageLoaded",
+].forEach(method => {
+  ICp[method] = Profile(
+    packageName => method + "(" + packageName + ")",
+    ICp[method],
+  );
+});

@@ -13,6 +13,8 @@ var projectContextModule = require('../project-context.js');
 var colonConverter = require('../utils/colon-converter.js');
 var Profile = require('../tool-env/profile.js').Profile;
 
+import { requestGarbageCollection } from "../utils/gc.js";
+
 // Opens a DDP connection to a package server. Loads the packages needed for a
 // DDP connection, then calls DDP connect to the package server URL in config,
 // using a current user-agent header composed by http-helpers.js.
@@ -187,7 +189,7 @@ var _updateServerPackageData = function (dataStore, options) {
 
     if (remoteData.collectionsCompressed) {
       var zlib = require('zlib');
-      var colsGzippedBuffer = new Buffer(
+      var colsGzippedBuffer = Buffer.from(
         remoteData.collectionsCompressed, 'base64');
       var colsJSON = new Promise((resolve, reject) => {
         zlib.gunzip(colsGzippedBuffer, (err, res) => {
@@ -219,6 +221,7 @@ var _updateServerPackageData = function (dataStore, options) {
   try {
     while (!done) {
       getSomeData();
+      requestGarbageCollection();
     }
   } finally {
     conn.close();

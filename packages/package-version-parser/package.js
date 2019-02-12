@@ -1,13 +1,16 @@
 Package.describe({
   summary: "Parses Meteor Smart Package version strings",
-  version: "3.0.9"
+  version: "3.2.0"
+});
+
+Npm.depends({
+  semver: "5.4.1"
 });
 
 Package.onUse(function (api) {
+  api.use('modules');
+  api.mainModule('package-version-parser.js');
   api.export('PackageVersion');
-  api.use('underscore');
-  api.addFiles(['semver410.js',
-                'package-version-parser.js']);
 });
 
 Package.onTest(function (api) {

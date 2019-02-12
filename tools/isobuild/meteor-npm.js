@@ -14,6 +14,7 @@ var buildmessage = require('../utils/buildmessage.js');
 var utils = require('../utils/utils.js');
 var runLog = require('../runners/run-log.js');
 var Profile = require('../tool-env/profile.js').Profile;
+import { version as npmVersion } from 'npm';
 import { execFileAsync } from "../utils/processes.js";
 import {
   get as getRebuildArgs
@@ -22,7 +23,19 @@ import {
   convert as convertColonsInPath
 } from "../utils/colon-converter.js";
 
+import { wrap as wrapOptimistic } from "optimism";
+import {
+  dirtyNodeModulesDirectory,
+  optimisticLStat,
+  optimisticStatOrNull,
+  optimisticReadJsonOrNull,
+  optimisticReaddir,
+} from "../fs/optimistic.js";
+
 var meteorNpm = exports;
+
+// Expose the version of npm in use from the dev bundle.
+meteorNpm.npmVersion = npmVersion;
 
 // if a user exits meteor while we're trying to create a .npm
 // directory, we will have temporary directories that we clean up
@@ -123,41 +136,84 @@ meteorNpm.updateDependencies = function (packageName,
   return true;
 };
 
-// Returns a flattened list of npm package names used in production.
-meteorNpm.getProdPackageNames = function (nodeModulesDir) {
-  var names = Object.create(null);
-  var lsCmdArgs = ["ls", "--json"];
+// Returns a flattened dictionary of npm package names used in production,
+// or false if there is no package.json file in the parent directory.
+export const getProdPackageNames = wrapOptimistic(nodeModulesDir => {
+  const names = Object.create(null);
+  const dirs = Object.create(null);
+  const nodeModulesDirStack = [];
 
-  const packageJsonPath = files.pathJoin(
-    files.pathDirname(nodeModulesDir),
-    "package.json"
-  );
+  // Returns true iff dir is a package directory.
+  function walk(dir) {
+    const packageJsonPath = files.pathJoin(dir, "package.json");
+    const packageJsonStat = optimisticStatOrNull(packageJsonPath);
 
-  const packageJsonStat = files.statOrNull(packageJsonPath);
-  if (packageJsonStat &&
-      packageJsonStat.isFile()) {
-    // If there is no package.json file, adding --production will cause
-    // the names object to be empty, which is not what we want.
-    lsCmdArgs.push("--production");
+    if (packageJsonStat &&
+        packageJsonStat.isFile()) {
+      const pkg = optimisticReadJsonOrNull(packageJsonPath);
+      const nodeModulesDir = files.pathJoin(dir, "node_modules");
+      nodeModulesDirStack.push(nodeModulesDir);
+
+      // Scan all dependencies except pkg.devDependencies.
+      scanDeps(pkg.dependencies);
+      scanDeps(pkg.peerDependencies);
+      scanDeps(pkg.optionalDependencies);
+      scanDeps(pkg.bundledDependencies);
+      // This typo is also honored.
+      scanDeps(pkg.bundleDependencies);
+
+      assert.strictEqual(
+        nodeModulesDirStack.pop(),
+        nodeModulesDir
+      );
+
+      return true;
+    }
+
+    return false;
   }
 
-  var lsResult = runNpmCommand(lsCmdArgs, nodeModulesDir);
-
-  function walk(deps) {
+  function scanDeps(deps) {
     if (! deps) {
       return;
     }
 
-    Object.keys(deps).forEach(function (name) {
-      names[name] = true;
-      walk(deps[name].dependencies);
+    Object.keys(deps).forEach(name => {
+      const resDir = resolve(name);
+      if (! resDir || _.has(dirs, resDir)) {
+        return;
+      }
+
+      // Record that we've seen this directory so that we don't try to
+      // walk it again.
+      dirs[resDir] = name;
+
+      if (walk(resDir)) {
+        // If resDir is indeed a package directory, record the package
+        // name in the set of production names.
+        names[name] = true;
+      }
     });
   }
 
-  walk(JSON.parse(lsResult.stdout).dependencies);
+  function resolve(name) {
+    for (let i = nodeModulesDirStack.length - 1; i >= 0; --i) {
+      const nodeModulesDir = nodeModulesDirStack[i];
+      const candidate = files.pathJoin(nodeModulesDir, name);
+      const stat = optimisticStatOrNull(candidate);
+      if (stat && stat.isDirectory()) {
+        return candidate;
+      }
+    }
+  }
 
-  return names;
-};
+  // If the top-level nodeModulesDir is not contained by a package
+  // directory with a package.json file, then we return false to indicate
+  // that we don't know or care which packages are production-specific.
+  // Concretely, this means your app needs to have a package.json file if
+  // you want any npm packages to be excluded in production.
+  return walk(files.pathDirname(nodeModulesDir)) && names;
+});
 
 const lastRebuildJSONFilename = ".meteor-last-rebuild-version.json";
 
@@ -216,16 +272,13 @@ function rebuildVersionsAreCompatible(pkgPath) {
   const versionFile =
     files.pathJoin(pkgPath, lastRebuildJSONFilename);
 
-  try {
-    var versions = JSON.parse(files.readFile(versionFile));
-  } catch (e) {
-    if (! (e instanceof SyntaxError ||
-           e.code === "ENOENT")) {
-      throw e;
-    }
-  }
+  return versionsAreCompatible(
+    optimisticReadJsonOrNull(versionFile));
+}
 
-  return versionsAreCompatible(versions);
+function isDirectory(path) {
+  const stat = optimisticStatOrNull(path);
+  return !! (stat && stat.isDirectory());
 }
 
 // Rebuilds any binary dependencies in the given node_modules directory,
@@ -234,19 +287,41 @@ meteorNpm.rebuildIfNonPortable =
 Profile("meteorNpm.rebuildIfNonPortable", function (nodeModulesDir) {
   const dirsToRebuild = [];
 
-  files.readdir(nodeModulesDir).forEach(function (pkg) {
-    const pkgPath = files.pathJoin(nodeModulesDir, pkg);
-
-    if (isPortable(pkgPath)) {
+  function scan(dir, scoped) {
+    if (! isDirectory(dir)) {
       return;
     }
 
-    if (rebuildVersionsAreCompatible(pkgPath)) {
-      return;
-    }
+    files.readdir(dir).forEach(item => {
+      if (item.startsWith(".")) {
+        // Ignore "hidden" files, such as node_modules/.bin directories.
+        return;
+      }
 
-    dirsToRebuild.push(pkgPath);
-  });
+      const path = files.pathJoin(dir, item);
+
+      if (! scoped &&
+          item.startsWith("@")) {
+        return scan(path, true);
+      }
+
+      if (! isDirectory(path)) {
+        return;
+      }
+
+      if (isPortable(path)) {
+        return;
+      }
+
+      if (rebuildVersionsAreCompatible(path)) {
+        return;
+      }
+
+      dirsToRebuild.push(path);
+    });
+  }
+
+  scan(nodeModulesDir);
 
   if (dirsToRebuild.length === 0) {
     return false;
@@ -271,7 +346,7 @@ Profile("meteorNpm.rebuildIfNonPortable", function (nodeModulesDir) {
   dirsToRebuild.forEach(function (pkgPath) {
     const tempPkgDir = tempPkgDirs[pkgPath] = files.pathJoin(
       tempNodeModules,
-      files.pathBasename(pkgPath)
+      files.pathRelative(nodeModulesDir, pkgPath)
     );
 
     // Copy the package directory instead of renaming it, so that the
@@ -293,6 +368,8 @@ Profile("meteorNpm.rebuildIfNonPortable", function (nodeModulesDir) {
     files.rm_recursive(tempDir);
     return false;
   }
+
+  dirtyNodeModulesDirectory(nodeModulesDir);
 
   // If the `npm rebuild` command succeeded, overwrite the original
   // package directories with the rebuilt package directories.
@@ -386,16 +463,23 @@ function copyNpmPackageWithSymlinkedNodeModules(fromPkgDir, toPkgDir) {
   });
 }
 
-function isPortable(dir) {
-  const lstat = files.lstat(dir);
+const portableCache = Object.create(null);
+
+// Increment this version to trigger the full portability check again.
+const portableVersion = 2;
+
+const isPortable = Profile("meteorNpm.isPortable", dir => {
+  const lstat = optimisticLStat(dir);
   if (! lstat.isDirectory()) {
     // Non-directory files are portable unless they end with .node.
     return ! dir.endsWith(".node");
   }
 
-  const pkgJsonStat = files.statOrNull(files.pathJoin(dir, "package.json"));
+  const pkgJsonPath = files.pathJoin(dir, "package.json");
+  const pkgJsonStat = optimisticStatOrNull(pkgJsonPath);
   const canCache = pkgJsonStat && pkgJsonStat.isFile();
-  const portableFile = files.pathJoin(dir, ".meteor-portable");
+  const portableFile = files.pathJoin(
+    dir, ".meteor-portable-" + portableVersion + ".json");
 
   if (canCache) {
     // Cache previous results by writing a boolean value to a hidden file
@@ -404,24 +488,44 @@ function isPortable(dir) {
     // put .meteor-portable files only in the individual top-level package
     // directories, so that they will get cleared away the next time those
     // packages are (re)installed.
-    try {
-      return JSON.parse(files.readFile(portableFile));
-    } catch (e) {
-      if (! (e instanceof SyntaxError ||
-             e.code === "ENOENT")) {
-        throw e;
-      }
+    const result = _.has(portableCache, portableFile)
+      ? portableCache[portableFile]
+      : optimisticReadJsonOrNull(portableFile, {
+          // Make optimisticReadJsonOrNull return null if there's a
+          // SyntaxError when parsing the .meteor-portable file.
+          allowSyntaxError: true
+        });
+
+    if (typeof result === "boolean") {
+      return result;
     }
+
   } else {
     // Clean up any .meteor-portable files we mistakenly wrote in
     // directories that do not contain package.json files. #7296
     fs.unlink(portableFile, error => {});
   }
 
-  const result = files.readdir(dir).every(
-    // Ignore files that start with a ".", such as .bin directories.
-    itemName => itemName.startsWith(".") ||
-      isPortable(files.pathJoin(dir, itemName)));
+  const pkgJson = canCache && optimisticReadJsonOrNull(pkgJsonPath, {
+    // A syntactically incorrect `package.json` isn't likely to have other
+    // effects since the npm itself likely won't install but the developer has
+    // no control over that happening so we should allow this.
+    allowSyntaxError: true
+  });
+
+  const hasBuildScript =
+    pkgJson &&
+    pkgJson.scripts &&
+    (pkgJson.scripts.preinstall ||
+     pkgJson.scripts.install ||
+     pkgJson.scripts.postinstall);
+
+  const result = hasBuildScript
+    ? false // Build scripts may not be portable.
+    : optimisticReaddir(dir).every(
+      // Ignore files that start with a ".", such as .bin directories.
+      itemName => itemName.startsWith(".") ||
+        isPortable(files.pathJoin(dir, itemName)));
 
   if (canCache) {
     // Write the .meteor-portable file asynchronously, and don't worry
@@ -430,12 +534,20 @@ function isPortable(dir) {
     fs.writeFile(
       portableFile,
       JSON.stringify(result) + "\n",
-      error => {},
+      error => {
+        // Once the asynchronous write finishes (successful or not), we no
+        // longer need to cache the written value in memory.
+        delete portableCache[portableFile];
+      },
     );
+
+    // Cache the result immediately in memory so we don't have to wait for
+    // file change notifications to invalidate optimisticReadJsonOrNull.
+    portableCache[portableFile] = result;
   }
 
   return result;
-}
+});
 
 // Return true if all of a package's npm dependencies are portable
 // (that is, if the node_modules can be copied anywhere and we'd
@@ -548,24 +660,37 @@ var updateExistingNpmDirectory = function (packageName, newPackageNpmDir,
     logUpdateDependencies(packageName, npmDependencies);
   }
 
+  makeNewPackageNpmDir(newPackageNpmDir);
+
   let preservedShrinkwrap;
 
   if (_.isEmpty(npmDependencies)) {
     // If there are no npmDependencies, make sure nothing is installed.
     preservedShrinkwrap = { dependencies: {} };
+
   } else if (isSubtreeOf(npmTree, minShrinkwrapTree)) {
     // If the top-level npm dependencies are already encompassed by the
     // npm-shrinkwrap.json file, then reuse that file.
     preservedShrinkwrap = shrinkwrappedDependenciesTree;
+
   } else {
-    // Otherwise install only the required npm packages and their
-    // dependencies.
-    preservedShrinkwrap = npmTree;
+    // Otherwise install npmTree.dependencies as if we were creating a new
+    // .npm/package directory, and leave preservedShrinkwrap empty.
+    installNpmDependencies(npmDependencies, newPackageNpmDir);
+
+    // Note: as of npm@4.0.0, npm-shrinkwrap.json files are regarded as
+    // "canonical," meaning `npm install` (without a package argument)
+    // will only install dependencies mentioned in npm-shrinkwrap.json.
+    // That's why we can't just update installedDependenciesTree to
+    // include npmTree.dependencies and hope for the best, because if the
+    // new versions of the required top-level packages have any additional
+    // transitive dependencies, those dependencies will not be installed
+    // unless previously mentioned in npm-shrinkwrap.json. Reference:
+    // https://github.com/npm/npm/blob/latest/CHANGELOG.md#no-more-partial-shrinkwraps-breaking
   }
 
-  makeNewPackageNpmDir(newPackageNpmDir);
-
-  if (!_.isEmpty(preservedShrinkwrap.dependencies)) {
+  if (! _.isEmpty(preservedShrinkwrap &&
+                  preservedShrinkwrap.dependencies)) {
     const newShrinkwrapFile = files.pathJoin(
       newPackageNpmDir,
       'npm-shrinkwrap.json'
@@ -577,10 +702,25 @@ var updateExistingNpmDirectory = function (packageName, newPackageNpmDir,
       JSON.stringify(preservedShrinkwrap, null, 2)
     );
 
+    const newPackageJsonFile = files.pathJoin(
+      newPackageNpmDir,
+      "package.json"
+    );
+
+    // We have to write out a minimal package.json file, else the results
+    // of installFromShrinkwrap may be incomplete in npm@5.
+    files.writeFile(
+      newPackageJsonFile,
+      JSON.stringify({
+        dependencies: npmDependencies
+      }, null, 2)
+    );
+
     // `npm install`
     installFromShrinkwrap(newPackageNpmDir);
 
     files.unlink(newShrinkwrapFile);
+    files.unlink(newPackageJsonFile);
   }
 
   completeNpmDirectory(packageName, newPackageNpmDir, packageNpmDir,
@@ -616,30 +756,56 @@ var createFreshNpmDirectory = function (packageName, newPackageNpmDir,
   }
 
   makeNewPackageNpmDir(newPackageNpmDir);
-  // install dependencies
-  _.each(npmDependencies, function (version, name) {
-    installNpmModule(name, version, newPackageNpmDir);
-  });
+
+  installNpmDependencies(npmDependencies, newPackageNpmDir);
 
   completeNpmDirectory(packageName, newPackageNpmDir, packageNpmDir,
                        npmDependencies);
 };
 
+function installNpmDependencies(dependencies, dir) {
+  const packageJsonPath = files.pathJoin(dir, "package.json");
+  const packageJsonExisted = files.exists(packageJsonPath);
+
+  files.writeFile(
+    packageJsonPath,
+    JSON.stringify({ dependencies }, null, 2)
+  );
+
+  try {
+    Object.keys(dependencies).forEach(name => {
+      const version = dependencies[name];
+      installNpmModule(name, version, dir);
+    });
+  } finally {
+    if (! packageJsonExisted) {
+      files.unlink(packageJsonPath);
+    }
+  }
+}
+
 // Shared code for updateExistingNpmDirectory and createFreshNpmDirectory.
-var completeNpmDirectory = function (packageName, newPackageNpmDir,
-                                     packageNpmDir, npmDependencies) {
+function completeNpmDirectory(
+  packageName,
+  newPackageNpmDir,
+  packageNpmDir,
+  npmDependencies,
+) {
   // Create a shrinkwrap file.
   shrinkwrap(newPackageNpmDir);
 
   // And stow a copy of npm-shrinkwrap too.
   files.copyFile(
     files.pathJoin(newPackageNpmDir, 'npm-shrinkwrap.json'),
-    files.pathJoin(newPackageNpmDir, 'node_modules', '.npm-shrinkwrap.json'));
+    files.pathJoin(newPackageNpmDir, 'node_modules', '.npm-shrinkwrap.json')
+  );
 
   createReadme(newPackageNpmDir);
   createNodeVersion(newPackageNpmDir);
   files.renameDirAlmostAtomically(newPackageNpmDir, packageNpmDir);
-};
+
+  dirtyNodeModulesDirectory(files.pathJoin(packageNpmDir, "node_modules"));
+}
 
 var createReadme = function (newPackageNpmDir) {
   // This file gets checked in to version control by users, so resist the
@@ -691,9 +857,22 @@ Profile("meteorNpm.runNpmCommand", function (args, cwd) {
     isWindows ? "npm.cmd" : "npm"
   ));
 
+  // On Windows, `.cmd` and `.bat` files must be launched in a shell per:
+  // http://nodejs.org/api/child_process.html#child_process_spawning_bat_and_cmd_files_on_windows
+  //
+  // Additionally, the COMSPEC environment variable is meant to have the path to
+  // cmd.exe, but we'll use 'cmd.exe' if it's not set, in the same spirit as
+  // http://nodejs.org/api/child_process.html#child_process_shell_requirements.
+
+  let commandToRun = npmPath;
+  if (isWindows) {
+    args = ['/c', npmPath, ...args];
+    commandToRun = process.env.ComSpec || "cmd.exe";
+  }
+
   if (meteorNpm._printNpmCalls) {
     // only used by test-bundler.js
-    process.stdout.write('cd ' + cwd + ' && ' + npmPath + ' ' +
+    process.stdout.write('cd ' + cwd + ' && ' + commandToRun + ' ' +
                          args.join(' ') + ' ...\n');
   }
 
@@ -714,7 +893,7 @@ Profile("meteorNpm.runNpmCommand", function (args, cwd) {
 
     return new Promise(function (resolve) {
       require('child_process').execFile(
-        npmPath, args, opts, function (err, stdout, stderr) {
+        commandToRun, args, opts, function (err, stdout, stderr) {
           if (meteorNpm._printNpmCalls) {
             process.stdout.write(err ? 'failed\n' : 'done\n');
           }
@@ -727,7 +906,7 @@ Profile("meteorNpm.runNpmCommand", function (args, cwd) {
           });
         }
       );
-    });
+    }).await();
 
   }).await();
 });
@@ -768,6 +947,11 @@ function getInstalledDependenciesTree(dir) {
       const pkgDir = files.pathJoin(nodeModulesDir, item);
       const pkgJsonPath = files.pathJoin(pkgDir, "package.json");
 
+      if (item.startsWith("@")) {
+        Object.assign(result, ls(pkgDir));
+        return;
+      }
+
       let pkg;
       try {
         pkg = JSON.parse(files.readFile(pkgJsonPath));
@@ -775,18 +959,35 @@ function getInstalledDependenciesTree(dir) {
         if (! pkg) return;
       }
 
-      const info = result[item] = {
+      const name = pkg.name || item;
+
+      const info = result[name] = {
         version: pkg.version
       };
 
+      const from = pkg._from || pkg.from;
+      if (from) {
+        // Fix for https://github.com/meteor/meteor/issues/9477:
+        const prefix = name + "@";
+        let fromUrl = from;
+        if (fromUrl.startsWith(prefix)) {
+          fromUrl = fromUrl.slice(prefix.length);
+        }
+
+        if (utils.isNpmUrl(fromUrl) &&
+            ! utils.isNpmUrl(info.version)) {
+          info.version = fromUrl;
+        }
+      }
+
       const resolved = pkg._resolved || pkg.resolved;
-      if (resolved) {
+      if (resolved && resolved !== info.version) {
         info.resolved = resolved;
       }
 
-      const from = pkg._from || pkg.from;
-      if (from) {
-        info.from = from;
+      const integrity = pkg._integrity || pkg.integrity;
+      if (integrity) {
+        info.integrity = integrity;
       }
 
       const deps = ls(files.pathJoin(pkgDir, "node_modules"));
@@ -799,13 +1000,17 @@ function getInstalledDependenciesTree(dir) {
   }
 
   return {
+    lockfileVersion: 1,
     dependencies: ls(files.pathJoin(dir, "node_modules"))
   };
 }
 
-var getShrinkwrappedDependenciesTree = function (dir) {
-  var shrinkwrapFile = files.readFile(files.pathJoin(dir, 'npm-shrinkwrap.json'));
-  return JSON.parse(shrinkwrapFile);
+function getShrinkwrappedDependenciesTree(dir) {
+  const shrinkwrap = JSON.parse(files.readFile(
+    files.pathJoin(dir, 'npm-shrinkwrap.json')
+  ));
+  shrinkwrap.lockfileVersion = 1;
+  return shrinkwrap;
 };
 
 // Maps a "dependency object" (a thing you find in `npm ls --json` or
@@ -842,39 +1047,47 @@ var getShrinkwrappedDependencies = function (dir) {
   return treeToDependencies(getShrinkwrappedDependenciesTree(dir));
 };
 
-var installNpmModule = function (name, version, dir) {
-  ensureConnected();
+const moduleDoesResolve = meteorNpm.moduleDoesResolve = (dep) => {
+  try {
+    require.resolve(dep);
+  } catch (e) {
+    if (e.code !== 'MODULE_NOT_FOUND') {
+      throw e;
+    }
 
-  var installArg = utils.isNpmUrl(version)
-    ? version : (name + "@" + version);
+    return false;
+  }
+
+  return true;
+};
+
+const installNpmModule = meteorNpm.installNpmModule = (name, version, dir) => {
+  const installArg = utils.isNpmUrl(version)
+    ? version
+    : `${name}@${version}`;
 
   // We don't use npm.commands.install since we couldn't figure out
   // how to silence all output (specifically the installed tree which
   // is printed out with `console.log`)
-  //
-  // We used to use --force here, because the NPM cache is broken! See
-  // https://github.com/npm/npm/issues/3265 Basically, switching
-  // back and forth between a tarball fork of version X and the real
-  // version X could confuse NPM. But the main reason to use tarball
-  // URLs is to get a fork of the latest version with some fix, so
-  // it was easy to trigger this!
-  //
-  // We now use a forked version of npm with our PR
-  // https://github.com/npm/npm/pull/5137 to work around this.
-  var result = runNpmCommand(["install", installArg], dir);
+  const result = runNpmCommand(["install", installArg], dir);
 
   if (! result.success) {
-    var pkgNotFound = "404 '" + utils.quotemeta(name) +
-          "' is not in the npm registry";
-    var versionNotFound = "version not found: " + utils.quotemeta(name) +
-          '@' + utils.quotemeta(version);
+    const pkgNotFound =
+      `404 Not Found: ${utils.quotemeta(name)}@${utils.quotemeta(version)}`;
+
+    const versionNotFound =
+      "No matching version found for " +
+      `${utils.quotemeta(name)}@${utils.quotemeta(version)}`;
+
     if (result.stderr.match(new RegExp(pkgNotFound))) {
-      buildmessage.error("there is no npm package named '" + name + "'");
+      buildmessage.error(
+        `there is no npm package named '${name}' in the npm registry`);
     } else if (result.stderr.match(new RegExp(versionNotFound))) {
-      buildmessage.error(name + " version " + version + " " +
-                         "is not available in the npm registry");
+      buildmessage.error(
+        `${name} version ${version} is not available in the npm registry`);
     } else {
-      buildmessage.error(`couldn't install npm package ${name}@${version}: ${result.error}`);
+      buildmessage.error(
+        `couldn\'t install npm package ${name}@${version}: ${result.error}`);
     }
 
     // Recover by returning false from updateDependencies
@@ -916,26 +1129,15 @@ var installFromShrinkwrap = function (dir) {
       "Can't call `npm install` without a npm-shrinkwrap.json file present");
   }
 
-  ensureConnected();
-
-  const tempPkgJsonPath = files.pathJoin(dir, "package.json");
-  const pkgJsonExisted = files.exists(tempPkgJsonPath);
-  if (! pkgJsonExisted) {
-    // Writing an empty package.json file prevents ENOENT warnings about
-    // package.json not existing, which are noisy at best and sometimes
-    // seem to interfere with the install.
-    files.writeFile(tempPkgJsonPath, "{}\n", "utf8");
-  }
-
   // `npm install`, which reads npm-shrinkwrap.json.
   var result = runNpmCommand(["install"], dir);
 
-  if (! pkgJsonExisted) {
-    files.rm_recursive(tempPkgJsonPath);
-  }
-
   if (! result.success) {
-    buildmessage.error(`couldn't install npm packages from npm-shrinkwrap: ${result.error}`);
+    buildmessage.error(
+      "couldn't install npm packages from npm-shrinkwrap: " +
+        result.error
+    );
+
     // Recover by returning false from updateDependencies
     throw new NpmFailure;
   }
@@ -949,19 +1151,6 @@ var installFromShrinkwrap = function (dir) {
   });
 };
 
-// ensure we can reach http://npmjs.org before we try to install
-// dependencies. `npm install` times out after more than a minute.
-var ensureConnected = function () {
-  try {
-    httpHelpers.getUrl(process.env.NPM_CONFIG_REGISTRY || "http://registry.npmjs.org");
-  } catch (e) {
-    buildmessage.error("Can't install npm dependencies. " +
-                       "Are you connected to the internet?");
-    // Recover by returning false from updateDependencies
-    throw new NpmFailure;
-  }
-};
-
 // `npm shrinkwrap`
 function shrinkwrap(dir) {
   const tree = getInstalledDependenciesTree(dir);
@@ -971,17 +1160,24 @@ function shrinkwrap(dir) {
     JSON.stringify(tree, null, 2) + "\n"
   );
 
-  return tree;
+  const packageLockJsonPath =
+    files.pathJoin(dir, "package-lock.json");
+
+  // The normal `npm shrinkwrap` commands renames any package-lock.json
+  // file to npm-shrinkwrap.json, so this function should have the same
+  // side effect (i.e., removing package-lock.json if it exists).
+  if (files.exists(packageLockJsonPath)) {
+    files.unlink(packageLockJsonPath);
+  }
 }
 
 // Reduces a dependency tree (as read from a just-made npm-shrinkwrap.json or
 // from npm ls --json) to just the versions we want. Returns an object that does
 // not share state with its input
-var minimizeDependencyTree = function (tree) {
-  var minimizeModule = function (module) {
+function minimizeDependencyTree(tree) {
+  function minimizeModule(module) {
     var version;
-    if (module.resolved &&
-        !module.resolved.match(/^https?:\/\/registry.npmjs.org\//)) {
+    if (module.resolved && ! isUrlFromRegistry(module.resolved)) {
       version = module.resolved;
     } else if (utils.isNpmUrl(module.from)) {
       version = module.from;
@@ -997,14 +1193,22 @@ var minimizeDependencyTree = function (tree) {
       });
     }
     return minimized;
-  };
+  }
 
   var newTopLevelDependencies = {};
   _.each(tree.dependencies, function (module, name) {
     newTopLevelDependencies[name] = minimizeModule(module);
   });
   return {dependencies: newTopLevelDependencies};
-};
+}
+
+function isUrlFromRegistry(url) {
+  if (url.match(/^https?:\/\/registry.npmjs.org\//)) {
+    return true;
+  }
+  const NCR = process.env.NPM_CONFIG_REGISTRY;
+  return NCR && url.startsWith(NCR);
+}
 
 var logUpdateDependencies = function (packageName, npmDependencies) {
   runLog.log(packageName + ': updating npm dependencies -- ' +

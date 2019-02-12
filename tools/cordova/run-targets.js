@@ -1,9 +1,8 @@
 import _ from 'underscore';
 import chalk from 'chalk';
 import child_process from 'child_process';
-import eachline from 'eachline';
 
-import { load as loadIsopacket } from '../tool-env/isopackets.js';
+import { loadIsopackage } from '../tool-env/isopackets.js';
 import runLog from '../runners/run-log.js';
 import { Console } from '../console/console.js';
 import files from '../fs/files.js';
@@ -59,10 +58,9 @@ function openXcodeProject(projectDir) {
     return;
   }
 
-  const projectFilePath = files.pathJoin(projectDir, projectFilename);
 
   try {
-    execFileSync('open', [projectFilePath]);
+    execFileSync('open', ['-a', 'Xcode', projectDir]);
 
     Console.info();
     Console.info(
@@ -71,8 +69,7 @@ function openXcodeProject(projectDir) {
         "app on an iOS device. For further instructions, visit this " +
         "wiki page: ") +
       Console.url(
-        "https://github.com/meteor/meteor/wiki/" +
-        "How-to-run-your-app-on-an-iOS-device"
+        "https://guide.meteor.com/mobile.html#running-on-ios"
     ));
     Console.info();
   } catch (error) {
@@ -85,8 +82,7 @@ ${error.message}`);
     Console.error(message);
     Console.error(
       chalk.green("Instructions for running your app on an iOS device: ") +
-      Console.url("https://github.com/meteor/meteor/wiki/" +
-        "How-to-run-your-app-on-an-iOS-device")
+      Console.url("https://guide.meteor.com/mobile.html#running-on-ios")
     );
     Console.error();
   }
@@ -136,6 +132,8 @@ export class AndroidRunTarget extends CordovaRunTarget {
   }
 
   async tailLogs(cordovaProject, target) {
+    const { transform } = require("../utils/eachline.js");
+
     cordovaProject.runCommands(`tailing logs for ${this.displayName}`, async () => {
       await this.checkPlatformRequirementsAndSetEnv(cordovaProject);
 
@@ -145,10 +143,9 @@ export class AndroidRunTarget extends CordovaRunTarget {
         `CordovaLog:${logLevel}`, `chromium:${logLevel}`,
         `SystemWebViewClient:${logLevel}`, '*:F'];
 
-      const { Log } =
-          loadIsopacket('cordova-support')['logging'];
+      const { Log } = loadIsopackage('logging');
 
-      const logStream = eachline((line) => {
+      const logStream = transform(line => {
         const logEntry = logFromAndroidLogcatLine(Log, line);
         if (logEntry) {
           return `${logEntry}\n`;
@@ -174,6 +171,7 @@ function logFromAndroidLogcatLine(Log, line) {
   // "I/Tag(  PID): message"
   let match =
     line.match(/^([A-Z])\/([^\(]*?)\(\s*(\d+)\): (.*)$/);
+    let priority, tag, pid, message, logLevel, filename, lineNumber;
 
   if (match) {
     [, priority, tag, pid, message] = match;

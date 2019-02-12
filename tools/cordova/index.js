@@ -3,22 +3,40 @@ import assert from 'assert';
 import utils from '../utils/utils.js';
 import buildmessage from '../utils/buildmessage.js';
 
-import { oldToNew as oldToNewPluginIds, newToOld as newToOldPluginIds }
-  from 'cordova-lib/node_modules/cordova-registry-mapper';
-
 export const CORDOVA_ARCH = "web.cordova";
 
 export const CORDOVA_PLATFORMS = ['ios', 'android'];
 
+export const CORDOVA_DEV_BUNDLE_VERSIONS = {
+  'cordova-lib': '7.1.0',
+  'cordova-common': '2.1.1',
+  'cordova-registry-mapper': '1.1.15',
+};
+
 export const CORDOVA_PLATFORM_VERSIONS = {
-  'android': '5.1.1',
-  'ios': '4.1.0'
+  // This commit represents cordova-android@6.4.0 plus
+  // https://github.com/apache/cordova-android/pull/417, aka
+  // https://github.com/meteor/cordova-android/tree/v6.4.0-with-pr-417:
+  'android': 'https://github.com/meteor/cordova-android/tarball/317db7df0f7a054444197bc6d28453cf4ab23280',
+  'ios': '4.5.4'
 };
 
 const PLATFORM_TO_DISPLAY_NAME_MAP = {
   'ios': 'iOS',
   'android': 'Android'
 };
+
+export function ensureDevBundleDependencies() {
+  buildmessage.enterJob(
+    {
+      title: 'Installing Cordova in Meteor tool',
+    },
+    () => {
+      require("../cli/dev-bundle-helpers.js")
+        .ensureDependencies(CORDOVA_DEV_BUNDLE_VERSIONS);
+    }
+  );
+}
 
 export function displayNameForPlatform(platform) {
   return PLATFORM_TO_DISPLAY_NAME_MAP[platform] || platform;
@@ -62,6 +80,7 @@ export function pluginVersionsFromStarManifest(star) {
 }
 
 export function newPluginId(id) {
+  import { oldToNew as oldToNewPluginIds } from 'cordova-registry-mapper';
   return oldToNewPluginIds[id];
 }
 

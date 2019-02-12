@@ -1,13 +1,13 @@
 Package.describe({
   name: "modules-runtime",
-  version: "0.7.6",
+  version: "0.10.3",
   summary: "CommonJS module system",
   git: "https://github.com/benjamn/install",
   documentation: "README.md"
 });
 
 Npm.depends({
-  install: "0.8.1"
+  install: "0.12.2"
 });
 
 Package.onUse(function(api) {
@@ -18,7 +18,10 @@ Package.onUse(function(api) {
     bare: true
   });
 
-  api.addFiles("modules-runtime.js");
+  api.addFiles("client.js", "client");
+  api.addFiles("server.js", "server");
+  api.addFiles("profile.js");
+
   api.export("meteorInstall");
 });
 

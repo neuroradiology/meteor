@@ -2,7 +2,7 @@
 
 Package.describe({
   summary: "Core Meteor environment",
-  version: '1.2.17'
+  version: '1.9.2'
 });
 
 Package.registerBuildPlugin({
@@ -15,8 +15,6 @@ Npm.depends({
 });
 
 Package.onUse(function (api) {
-  api.use('underscore', ['client', 'server']);
-
   api.use('isobuild:compiler-plugin@1.0.0');
 
   api.export('Meteor');
@@ -30,6 +28,7 @@ Package.onUse(function (api) {
   api.export("meteorEnv");
 
   api.addFiles('cordova_environment.js', 'web.cordova');
+  api.addFiles('define-package.js', ['client', 'server']);
   api.addFiles('helpers.js', ['client', 'server']);
   api.addFiles('setimmediate.js', ['client', 'server']);
   api.addFiles('timers.js', ['client', 'server']);

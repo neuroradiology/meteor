@@ -1,8 +1,11 @@
 /// BCRYPT
 
-var bcrypt = NpmModuleBcrypt;
-var bcryptHash = Meteor.wrapAsync(bcrypt.hash);
-var bcryptCompare = Meteor.wrapAsync(bcrypt.compare);
+const bcrypt = NpmModuleBcrypt;
+const bcryptHash = Meteor.wrapAsync(bcrypt.hash);
+const bcryptCompare = Meteor.wrapAsync(bcrypt.compare);
+
+// Utility for grabbing user
+const getUserById = id => Meteor.users.findOne(id);
 
 // User records have a 'services.password.bcrypt' field on them to hold
 // their hashed passwords (unless they have a 'services.password.srp'
@@ -22,14 +25,14 @@ var bcryptCompare = Meteor.wrapAsync(bcrypt.compare);
 // "sha-256" and then passes the digest to bcrypt.
 
 
-Accounts._bcryptRounds = 10;
+Accounts._bcryptRounds = () => Accounts._options.bcryptRounds || 10;
 
 // Given a 'password' from the client, extract the string that we should
 // bcrypt. 'password' can be one of:
 //  - String (the plaintext password)
 //  - Object with 'digest' and 'algorithm' keys. 'algorithm' must be "sha-256".
 //
-var getPasswordString = function (password) {
+const getPasswordString = password => {
   if (typeof password === "string") {
     password = SHA256(password);
   } else { // 'password' is an object
@@ -47,9 +50,21 @@ var getPasswordString = function (password) {
 // SHA256 before bcrypt) or an object with properties `digest` and
 // `algorithm` (in which case we bcrypt `password.digest`).
 //
-var hashPassword = function (password) {
+const hashPassword = password => {
   password = getPasswordString(password);
-  return bcryptHash(password, Accounts._bcryptRounds);
+  return bcryptHash(password, Accounts._bcryptRounds());
+};
+
+// Extract the number of rounds used in the specified bcrypt hash.
+const getRoundsFromBcryptHash = hash => {
+  let rounds;
+  if (hash) {
+    const hashSegments = hash.split('$');
+    if (hashSegments.length > 2) {
+      rounds = parseInt(hashSegments[2], 10);
+    }
+  }
+  return rounds;
 };
 
 // Check whether the provided password matches the bcrypt'ed password in
@@ -58,33 +73,61 @@ var hashPassword = function (password) {
 // properties `digest` and `algorithm` (in which case we bcrypt
 // `password.digest`).
 //
-Accounts._checkPassword = function (user, password) {
-  var result = {
+Accounts._checkPassword = (user, password) => {
+  const result = {
     userId: user._id
   };
 
-  password = getPasswordString(password);
+  const formattedPassword = getPasswordString(password);
+  const hash = user.services.password.bcrypt;
+  const hashRounds = getRoundsFromBcryptHash(hash);
 
-  if (! bcryptCompare(password, user.services.password.bcrypt)) {
-    result.error = new Meteor.Error(403, "Incorrect password");
+  if (! bcryptCompare(formattedPassword, hash)) {
+    result.error = handleError("Incorrect password", false);
+  } else if (hash && Accounts._bcryptRounds() != hashRounds) {
+    // The password checks out, but the user's bcrypt hash needs to be updated.
+    Meteor.defer(() => {
+      Meteor.users.update({ _id: user._id }, {
+        $set: {
+          'services.password.bcrypt':
+            bcryptHash(formattedPassword, Accounts._bcryptRounds())
+        }
+      });
+    });
   }
 
   return result;
 };
-var checkPassword = Accounts._checkPassword;
+const checkPassword = Accounts._checkPassword;
+
+///
+/// ERROR HANDLER
+///
+const handleError = (msg, throwError = true) => {
+  const error = new Meteor.Error(
+    403,
+    Accounts._options.ambiguousErrorMessages
+      ? "Something went wrong. Please check your credentials."
+      : msg
+  );
+  if (throwError) {
+    throw error;
+  }
+  return error;
+};
 
 ///
 /// LOGIN
 ///
 
-Accounts._findUserByQuery = function (query) {
-  var user = null;
+Accounts._findUserByQuery = query => {
+  let user = null;
 
   if (query.id) {
-    user = Meteor.users.findOne({ _id: query.id });
+    user = getUserById(query.id);
   } else {
-    var fieldName;
-    var fieldValue;
+    let fieldName;
+    let fieldValue;
     if (query.username) {
       fieldName = 'username';
       fieldValue = query.username;
@@ -94,13 +137,13 @@ Accounts._findUserByQuery = function (query) {
     } else {
       throw new Error("shouldn't happen (validation missed something)");
     }
-    var selector = {};
+    let selector = {};
     selector[fieldName] = fieldValue;
     user = Meteor.users.findOne(selector);
     // If user is not found, try a case insensitive lookup
     if (!user) {
       selector = selectorForFastCaseInsensitiveLookup(fieldName, fieldValue);
-      var candidateUsers = Meteor.users.find(selector).fetch();
+      const candidateUsers = Meteor.users.find(selector).fetch();
       // No match if multiple candidates are found
       if (candidateUsers.length === 1) {
         user = candidateUsers[0];
@@ -121,11 +164,8 @@ Accounts._findUserByQuery = function (query) {
  * @returns {Object} A user if found, else null
  * @importFromPackage accounts-base
  */
-Accounts.findUserByUsername = function (username) {
-  return Accounts._findUserByQuery({
-    username: username
-  });
-};
+Accounts.findUserByUsername = 
+  username => Accounts._findUserByQuery({ username });
 
 /**
  * @summary Finds the user with the specified email.
@@ -137,11 +177,7 @@ Accounts.findUserByUsername = function (username) {
  * @returns {Object} A user if found, else null
  * @importFromPackage accounts-base
  */
-Accounts.findUserByEmail = function (email) {
-  return Accounts._findUserByQuery({
-    email: email
-  });
-};
+Accounts.findUserByEmail = email => Accounts._findUserByQuery({ email });
 
 // Generates a MongoDB selector that can be used to perform a fast case
 // insensitive lookup for the given fieldName and string. Since MongoDB does
@@ -152,48 +188,48 @@ Accounts.findUserByEmail = function (email) {
 // http://docs.mongodb.org/v2.6/reference/operator/query/regex/#index-use),
 // this has been found to greatly improve performance (from 1200ms to 5ms in a
 // test with 1.000.000 users).
-var selectorForFastCaseInsensitiveLookup = function (fieldName, string) {
+const selectorForFastCaseInsensitiveLookup = (fieldName, string) => {
   // Performance seems to improve up to 4 prefix characters
-  var prefix = string.substring(0, Math.min(string.length, 4));
-  var orClause = _.map(generateCasePermutationsForString(prefix),
-    function (prefixPermutation) {
-      var selector = {};
+  const prefix = string.substring(0, Math.min(string.length, 4));
+  const orClause = generateCasePermutationsForString(prefix).map(
+    prefixPermutation => {
+      const selector = {};
       selector[fieldName] =
-        new RegExp('^' + Meteor._escapeRegExp(prefixPermutation));
+        new RegExp(`^${Meteor._escapeRegExp(prefixPermutation)}`);
       return selector;
     });
-  var caseInsensitiveClause = {};
+  const caseInsensitiveClause = {};
   caseInsensitiveClause[fieldName] =
-    new RegExp('^' + Meteor._escapeRegExp(string) + '$', 'i')
+    new RegExp(`^${Meteor._escapeRegExp(string)}$`, 'i')
   return {$and: [{$or: orClause}, caseInsensitiveClause]};
 }
 
 // Generates permutations of all case variations of a given string.
-var generateCasePermutationsForString = function (string) {
-  var permutations = [''];
-  for (var i = 0; i < string.length; i++) {
-    var ch = string.charAt(i);
-    permutations = _.flatten(_.map(permutations, function (prefix) {
-      var lowerCaseChar = ch.toLowerCase();
-      var upperCaseChar = ch.toUpperCase();
+const generateCasePermutationsForString = string => {
+  let permutations = [''];
+  for (let i = 0; i < string.length; i++) {
+    const ch = string.charAt(i);
+    permutations = [].concat(...(permutations.map(prefix => {
+      const lowerCaseChar = ch.toLowerCase();
+      const upperCaseChar = ch.toUpperCase();
       // Don't add unneccesary permutations when ch is not a letter
       if (lowerCaseChar === upperCaseChar) {
         return [prefix + ch];
       } else {
         return [prefix + lowerCaseChar, prefix + upperCaseChar];
       }
-    }));
+    })));
   }
   return permutations;
 }
 
-var checkForCaseInsensitiveDuplicates = function (fieldName, displayName, fieldValue, ownUserId) {
+const checkForCaseInsensitiveDuplicates = (fieldName, displayName, fieldValue, ownUserId) => {
   // Some tests need the ability to add users with the same case insensitive
   // value, hence the _skipCaseInsensitiveChecksForTest check
-  var skipCheck = _.has(Accounts._skipCaseInsensitiveChecksForTest, fieldValue);
+  const skipCheck = Object.prototype.hasOwnProperty.call(Accounts._skipCaseInsensitiveChecksForTest, fieldValue);
 
   if (fieldValue && !skipCheck) {
-    var matchedUsers = Meteor.users.find(
+    const matchedUsers = Meteor.users.find(
       selectorForFastCaseInsensitiveLookup(fieldName, fieldValue)).fetch();
 
     if (matchedUsers.length > 0 &&
@@ -202,29 +238,29 @@ var checkForCaseInsensitiveDuplicates = function (fieldName, displayName, fieldV
         // Otherwise, check to see if there are multiple matches or a match
         // that is not us
         (matchedUsers.length > 1 || matchedUsers[0]._id !== ownUserId))) {
-      throw new Meteor.Error(403, displayName + " already exists.");
+      handleError(`${displayName} already exists.`);
     }
   }
 };
 
 // XXX maybe this belongs in the check package
-var NonEmptyString = Match.Where(function (x) {
+const NonEmptyString = Match.Where(x => {
   check(x, String);
   return x.length > 0;
 });
 
-var userQueryValidator = Match.Where(function (user) {
+const userQueryValidator = Match.Where(user => {
   check(user, {
     id: Match.Optional(NonEmptyString),
     username: Match.Optional(NonEmptyString),
     email: Match.Optional(NonEmptyString)
   });
-  if (_.keys(user).length !== 1)
+  if (Object.keys(user).length !== 1)
     throw new Match.Error("User property must have exactly one field");
   return true;
 });
 
-var passwordValidator = Match.OneOf(
+const passwordValidator = Match.OneOf(
   String,
   { digest: String, algorithm: String }
 );
@@ -243,7 +279,7 @@ var passwordValidator = Match.OneOf(
 //
 // Note that neither password option is secure without SSL.
 //
-Accounts.registerLoginHandler("password", function (options) {
+Accounts.registerLoginHandler("password", options => {
   if (! options.password || options.srp)
     return undefined; // don't handle
 
@@ -253,13 +289,15 @@ Accounts.registerLoginHandler("password", function (options) {
   });
 
 
-  var user = Accounts._findUserByQuery(options.user);
-  if (!user)
-    throw new Meteor.Error(403, "User not found");
+  const user = Accounts._findUserByQuery(options.user);
+  if (!user) {
+    handleError("User not found");
+  }
 
   if (!user.services || !user.services.password ||
-      !(user.services.password.bcrypt || user.services.password.srp))
-    throw new Meteor.Error(403, "User has no password set");
+      !(user.services.password.bcrypt || user.services.password.srp)) {
+    handleError("User has no password set");
+  }
 
   if (!user.services.password.bcrypt) {
     if (typeof options.password === "string") {
@@ -267,14 +305,14 @@ Accounts.registerLoginHandler("password", function (options) {
       // not upgraded to bcrypt yet. We don't attempt to tell the client
       // to upgrade to bcrypt, because it might be a standalone DDP
       // client doesn't know how to do such a thing.
-      var verifier = user.services.password.srp;
-      var newVerifier = SRP.generateVerifier(options.password, {
+      const verifier = user.services.password.srp;
+      const newVerifier = SRP.generateVerifier(options.password, {
         identity: verifier.identity, salt: verifier.salt});
 
       if (verifier.verifier !== newVerifier.verifier) {
         return {
-          userId: user._id,
-          error: new Meteor.Error(403, "Incorrect password")
+          userId: Accounts._options.ambiguousErrorMessages ? null : user._id,
+          error: handleError("Incorrect password", false)
         };
       }
 
@@ -309,9 +347,10 @@ Accounts.registerLoginHandler("password", function (options) {
 // try the SRP upgrade path.
 //
 // XXX COMPAT WITH 0.8.1.3
-Accounts.registerLoginHandler("password", function (options) {
-  if (!options.srp || !options.password)
+Accounts.registerLoginHandler("password", options => {
+  if (!options.srp || !options.password) {
     return undefined; // don't handle
+  }
 
   check(options, {
     user: userQueryValidator,
@@ -319,34 +358,38 @@ Accounts.registerLoginHandler("password", function (options) {
     password: passwordValidator
   });
 
-  var user = Accounts._findUserByQuery(options.user);
-  if (!user)
-    throw new Meteor.Error(403, "User not found");
+  const user = Accounts._findUserByQuery(options.user);
+  if (!user) {
+    handleError("User not found");
+  }
 
   // Check to see if another simultaneous login has already upgraded
   // the user record to bcrypt.
-  if (user.services && user.services.password && user.services.password.bcrypt)
+  if (user.services && user.services.password && user.services.password.bcrypt) {
     return checkPassword(user, options.password);
+  }
 
-  if (!(user.services && user.services.password && user.services.password.srp))
-    throw new Meteor.Error(403, "User has no password set");
+  if (!(user.services && user.services.password && user.services.password.srp)) {
+    handleError("User has no password set");
+  }
 
-  var v1 = user.services.password.srp.verifier;
-  var v2 = SRP.generateVerifier(
+  const v1 = user.services.password.srp.verifier;
+  const v2 = SRP.generateVerifier(
     null,
     {
       hashedIdentityAndPassword: options.srp,
       salt: user.services.password.srp.salt
     }
   ).verifier;
-  if (v1 !== v2)
+  if (v1 !== v2) {
     return {
-      userId: user._id,
-      error: new Meteor.Error(403, "Incorrect password")
+      userId: Accounts._options.ambiguousErrorMessages ? null : user._id,
+      error: handleError("Incorrect password", false)
     };
+  }
 
   // Upgrade to bcrypt on successful login.
-  var salted = hashPassword(options.password);
+  const salted = hashPassword(options.password);
   Meteor.users.update(
     user._id,
     {
@@ -372,15 +415,16 @@ Accounts.registerLoginHandler("password", function (options) {
  * @param {String} newUsername A new username for the user.
  * @importFromPackage accounts-base
  */
-Accounts.setUsername = function (userId, newUsername) {
+Accounts.setUsername = (userId, newUsername) => {
   check(userId, NonEmptyString);
   check(newUsername, NonEmptyString);
 
-  var user = Meteor.users.findOne(userId);
-  if (!user)
-    throw new Meteor.Error(403, "User not found");
+  const user = getUserById(userId);
+  if (!user) {
+    handleError("User not found");
+  }
 
-  var oldUsername = user.username;
+  const oldUsername = user.username;
 
   // Perform a case insensitive check for duplicates before update
   checkForCaseInsensitiveDuplicates('username', 'Username', newUsername, user._id);
@@ -417,16 +461,19 @@ Meteor.methods({changePassword: function (oldPassword, newPassword) {
   check(oldPassword, passwordValidator);
   check(newPassword, passwordValidator);
 
-  if (!this.userId)
+  if (!this.userId) {
     throw new Meteor.Error(401, "Must be logged in");
+  }
 
-  var user = Meteor.users.findOne(this.userId);
-  if (!user)
-    throw new Meteor.Error(403, "User not found");
+  const user = getUserById(this.userId);
+  if (!user) {
+    handleError("User not found");
+  }
 
   if (!user.services || !user.services.password ||
-      (!user.services.password.bcrypt && !user.services.password.srp))
-    throw new Meteor.Error(403, "User has no password set");
+      (!user.services.password.bcrypt && !user.services.password.srp)) {
+    handleError("User has no password set");
+  }
 
   if (! user.services.password.bcrypt) {
     throw new Meteor.Error(400, "old password format", EJSON.stringify({
@@ -435,17 +482,18 @@ Meteor.methods({changePassword: function (oldPassword, newPassword) {
     }));
   }
 
-  var result = checkPassword(user, oldPassword);
-  if (result.error)
+  const result = checkPassword(user, oldPassword);
+  if (result.error) {
     throw result.error;
+  }
 
-  var hashed = hashPassword(newPassword);
+  const hashed = hashPassword(newPassword);
 
   // It would be better if this removed ALL existing tokens and replaced
   // the token for the current connection with a new one, but that would
   // be tricky, so we'll settle for just replacing all tokens other than
   // the one for the current connection.
-  var currentToken = Accounts._getLoginToken(this.connection.id);
+  const currentToken = Accounts._getLoginToken(this.connection.id);
   Meteor.users.update(
     { _id: this.userId },
     {
@@ -472,14 +520,15 @@ Meteor.methods({changePassword: function (oldPassword, newPassword) {
  * @param {Object} options.logout Logout all current connections with this userId (default: true)
  * @importFromPackage accounts-base
  */
-Accounts.setPassword = function (userId, newPlaintextPassword, options) {
-  options = _.extend({logout: true}, options);
+Accounts.setPassword = (userId, newPlaintextPassword, options) => {
+  options = { logout: true , ...options };
 
-  var user = Meteor.users.findOne(userId);
-  if (!user)
+  const user = getUserById(userId);
+  if (!user) {
     throw new Meteor.Error(403, "User not found");
+  }
 
-  var update = {
+  const update = {
     $unset: {
       'services.password.srp': 1, // XXX COMPAT WITH 0.8.1.3
       'services.password.reset': 1
@@ -499,22 +548,177 @@ Accounts.setPassword = function (userId, newPlaintextPassword, options) {
 /// RESETTING VIA EMAIL
 ///
 
+// Utility for plucking addresses from emails
+const pluckAddresses = (emails = []) => emails.map(email => email.address);
+
 // Method called by a user to request a password reset email. This is
 // the start of the reset process.
-Meteor.methods({forgotPassword: function (options) {
+Meteor.methods({forgotPassword: options => {
   check(options, {email: String});
 
-  var user = Accounts.findUserByEmail(options.email);
-  if (!user)
-    throw new Meteor.Error(403, "User not found");
+  const user = Accounts.findUserByEmail(options.email);
+  if (!user) {
+    handleError("User not found");
+  }
 
-  const emails = _.pluck(user.emails || [], 'address');
-  const caseSensitiveEmail = _.find(emails, email => {
-    return email.toLowerCase() === options.email.toLowerCase();
-  });
+  const emails = pluckAddresses(user.emails);
+  const caseSensitiveEmail = emails.find(
+    email => email.toLowerCase() === options.email.toLowerCase()
+  );
 
   Accounts.sendResetPasswordEmail(user._id, caseSensitiveEmail);
 }});
+
+/**
+ * @summary Generates a reset token and saves it into the database.
+ * @locus Server
+ * @param {String} userId The id of the user to generate the reset token for.
+ * @param {String} email Which address of the user to generate the reset token for. This address must be in the user's `emails` list. If `null`, defaults to the first email in the list.
+ * @param {String} reason `resetPassword` or `enrollAccount`.
+ * @param {Object} [extraTokenData] Optional additional data to be added into the token record.
+ * @returns {Object} Object with {email, user, token} values.
+ * @importFromPackage accounts-base
+ */
+Accounts.generateResetToken = (userId, email, reason, extraTokenData) => {
+  // Make sure the user exists, and email is one of their addresses.
+  const user = getUserById(userId);
+  if (!user) {
+    handleError("Can't find user");
+  }
+
+  // pick the first email if we weren't passed an email.
+  if (!email && user.emails && user.emails[0]) {
+    email = user.emails[0].address;
+  }
+
+  // make sure we have a valid email
+  if (!email || 
+    !(pluckAddresses(user.emails).includes(email))) {
+    handleError("No such email for user.");
+  }
+
+  const token = Random.secret();
+  const tokenRecord = {
+    token,
+    email,
+    when: new Date()
+  };
+
+  if (reason === 'resetPassword') {
+    tokenRecord.reason = 'reset';
+  } else if (reason === 'enrollAccount') {
+    tokenRecord.reason = 'enroll';
+  } else if (reason) {
+    // fallback so that this function can be used for unknown reasons as well
+    tokenRecord.reason = reason;
+  }
+
+  if (extraTokenData) {
+    Object.assign(tokenRecord, extraTokenData);
+  }
+
+  Meteor.users.update({_id: user._id}, {$set: {
+    'services.password.reset': tokenRecord
+  }});
+
+  // before passing to template, update user object with new token
+  Meteor._ensure(user, 'services', 'password').reset = tokenRecord;
+
+  return {email, user, token};
+};
+
+/**
+ * @summary Generates an e-mail verification token and saves it into the database.
+ * @locus Server
+ * @param {String} userId The id of the user to generate the  e-mail verification token for.
+ * @param {String} email Which address of the user to generate the e-mail verification token for. This address must be in the user's `emails` list. If `null`, defaults to the first unverified email in the list.
+ * @param {Object} [extraTokenData] Optional additional data to be added into the token record.
+ * @returns {Object} Object with {email, user, token} values.
+ * @importFromPackage accounts-base
+ */
+Accounts.generateVerificationToken = (userId, email, extraTokenData) => {
+  // Make sure the user exists, and email is one of their addresses.
+  const user = getUserById(userId);
+  if (!user) {
+    handleError("Can't find user");
+  }
+
+  // pick the first unverified email if we weren't passed an email.
+  if (!email) {
+    const emailRecord = (user.emails || []).find(e => !e.verified);
+    email = (emailRecord || {}).address;
+
+    if (!email) {
+      handleError("That user has no unverified email addresses.");
+    }
+  }
+
+  // make sure we have a valid email
+  if (!email || 
+    !(pluckAddresses(user.emails).includes(email))) {
+    handleError("No such email for user.");
+  }
+
+  const token = Random.secret();
+  const tokenRecord = {
+    token,
+    // TODO: This should probably be renamed to "email" to match reset token record.
+    address: email,
+    when: new Date()
+  };
+
+  if (extraTokenData) {
+    Object.assign(tokenRecord, extraTokenData);
+  }
+
+  Meteor.users.update({_id: user._id}, {$push: {
+    'services.email.verificationTokens': tokenRecord
+  }});
+
+  // before passing to template, update user object with new token
+  Meteor._ensure(user, 'services', 'email');
+  if (!user.services.email.verificationTokens) {
+    user.services.email.verificationTokens = [];
+  }
+  user.services.email.verificationTokens.push(tokenRecord);
+
+  return {email, user, token};
+};
+
+/**
+ * @summary Creates options for email sending for reset password and enroll account emails.
+ * You can use this function when customizing a reset password or enroll account email sending.
+ * @locus Server
+ * @param {Object} email Which address of the user's to send the email to.
+ * @param {Object} user The user object to generate options for.
+ * @param {String} url URL to which user is directed to confirm the email.
+ * @param {String} reason `resetPassword` or `enrollAccount`.
+ * @returns {Object} Options which can be passed to `Email.send`.
+ * @importFromPackage accounts-base
+ */
+Accounts.generateOptionsForEmail = (email, user, url, reason) => {
+  const options = {
+    to: email,
+    from: Accounts.emailTemplates[reason].from
+      ? Accounts.emailTemplates[reason].from(user)
+      : Accounts.emailTemplates.from,
+    subject: Accounts.emailTemplates[reason].subject(user)
+  };
+
+  if (typeof Accounts.emailTemplates[reason].text === 'function') {
+    options.text = Accounts.emailTemplates[reason].text(user, url);
+  }
+
+  if (typeof Accounts.emailTemplates[reason].html === 'function') {
+    options.html = Accounts.emailTemplates[reason].html(user, url);
+  }
+
+  if (typeof Accounts.emailTemplates.headers === 'object') {
+    options.headers = Accounts.emailTemplates.headers;
+  }
+
+  return options;
+};
 
 // send the user an email with a link that when opened allows the user
 // to set a new password, without the old password.
@@ -524,57 +728,17 @@ Meteor.methods({forgotPassword: function (options) {
  * @locus Server
  * @param {String} userId The id of the user to send email to.
  * @param {String} [email] Optional. Which address of the user's to send the email to. This address must be in the user's `emails` list. Defaults to the first email in the list.
+ * @param {Object} [extraTokenData] Optional additional data to be added into the token record.
+ * @returns {Object} Object with {email, user, token, url, options} values.
  * @importFromPackage accounts-base
  */
-Accounts.sendResetPasswordEmail = function (userId, email) {
-  // Make sure the user exists, and email is one of their addresses.
-  var user = Meteor.users.findOne(userId);
-  if (!user)
-    throw new Error("Can't find user");
-  // pick the first email if we weren't passed an email.
-  if (!email && user.emails && user.emails[0])
-    email = user.emails[0].address;
-  // make sure we have a valid email
-  if (!email || !_.contains(_.pluck(user.emails || [], 'address'), email))
-    throw new Error("No such email for user.");
-
-  var token = Random.secret();
-  var when = new Date();
-  var tokenRecord = {
-    token: token,
-    email: email,
-    when: when
-  };
-  Meteor.users.update(userId, {$set: {
-    "services.password.reset": tokenRecord
-  }});
-  // before passing to template, update user object with new token
-  Meteor._ensure(user, 'services', 'password').reset = tokenRecord;
-
-  var resetPasswordUrl = Accounts.urls.resetPassword(token);
-
-  var options = {
-    to: email,
-    from: Accounts.emailTemplates.resetPassword.from
-      ? Accounts.emailTemplates.resetPassword.from(user)
-      : Accounts.emailTemplates.from,
-    subject: Accounts.emailTemplates.resetPassword.subject(user)
-  };
-
-  if (typeof Accounts.emailTemplates.resetPassword.text === 'function') {
-    options.text =
-      Accounts.emailTemplates.resetPassword.text(user, resetPasswordUrl);
-  }
-
-  if (typeof Accounts.emailTemplates.resetPassword.html === 'function')
-    options.html =
-      Accounts.emailTemplates.resetPassword.html(user, resetPasswordUrl);
-
-  if (typeof Accounts.emailTemplates.headers === 'object') {
-    options.headers = Accounts.emailTemplates.headers;
-  }
-
+Accounts.sendResetPasswordEmail = (userId, email, extraTokenData) => {
+  const {email: realEmail, user, token} =
+    Accounts.generateResetToken(userId, email, 'resetPassword', extraTokenData);
+  const url = Accounts.urls.resetPassword(token);
+  const options = Accounts.generateOptionsForEmail(realEmail, user, url, 'resetPassword');
   Email.send(options);
+  return {email: realEmail, user, token, url, options};
 };
 
 // send the user an email informing them that their account was created, with
@@ -590,110 +754,70 @@ Accounts.sendResetPasswordEmail = function (userId, email) {
  * @locus Server
  * @param {String} userId The id of the user to send email to.
  * @param {String} [email] Optional. Which address of the user's to send the email to. This address must be in the user's `emails` list. Defaults to the first email in the list.
+ * @param {Object} [extraTokenData] Optional additional data to be added into the token record.
+ * @returns {Object} Object with {email, user, token, url, options} values.
  * @importFromPackage accounts-base
  */
-Accounts.sendEnrollmentEmail = function (userId, email) {
-  // XXX refactor! This is basically identical to sendResetPasswordEmail.
-
-  // Make sure the user exists, and email is in their addresses.
-  var user = Meteor.users.findOne(userId);
-  if (!user)
-    throw new Error("Can't find user");
-  // pick the first email if we weren't passed an email.
-  if (!email && user.emails && user.emails[0])
-    email = user.emails[0].address;
-  // make sure we have a valid email
-  if (!email || !_.contains(_.pluck(user.emails || [], 'address'), email))
-    throw new Error("No such email for user.");
-
-  var token = Random.secret();
-  var when = new Date();
-  var tokenRecord = {
-    token: token,
-    email: email,
-    when: when
-  };
-  Meteor.users.update(userId, {$set: {
-    "services.password.reset": tokenRecord
-  }});
-
-  // before passing to template, update user object with new token
-  Meteor._ensure(user, 'services', 'password').reset = tokenRecord;
-
-  var enrollAccountUrl = Accounts.urls.enrollAccount(token);
-
-  var options = {
-    to: email,
-    from: Accounts.emailTemplates.enrollAccount.from
-      ? Accounts.emailTemplates.enrollAccount.from(user)
-      : Accounts.emailTemplates.from,
-    subject: Accounts.emailTemplates.enrollAccount.subject(user)
-  };
-
-  if (typeof Accounts.emailTemplates.enrollAccount.text === 'function') {
-    options.text =
-      Accounts.emailTemplates.enrollAccount.text(user, enrollAccountUrl);
-  }
-
-  if (typeof Accounts.emailTemplates.enrollAccount.html === 'function')
-    options.html =
-      Accounts.emailTemplates.enrollAccount.html(user, enrollAccountUrl);
-
-  if (typeof Accounts.emailTemplates.headers === 'object') {
-    options.headers = Accounts.emailTemplates.headers;
-  }
-
+Accounts.sendEnrollmentEmail = (userId, email, extraTokenData) => {
+  const {email: realEmail, user, token} =
+    Accounts.generateResetToken(userId, email, 'enrollAccount', extraTokenData);
+  const url = Accounts.urls.enrollAccount(token);
+  const options = Accounts.generateOptionsForEmail(realEmail, user, url, 'enrollAccount');
   Email.send(options);
+  return {email: realEmail, user, token, url, options};
 };
 
 
 // Take token from sendResetPasswordEmail or sendEnrollmentEmail, change
 // the users password, and log them in.
-Meteor.methods({resetPassword: function (token, newPassword) {
-  var self = this;
+Meteor.methods({resetPassword: function (...args) {
+  const token = args[0];
+  const newPassword = args[1];
   return Accounts._loginMethod(
-    self,
+    this,
     "resetPassword",
-    arguments,
+    args,
     "password",
-    function () {
+    () => {
       check(token, String);
       check(newPassword, passwordValidator);
 
-      var user = Meteor.users.findOne({
+      const user = Meteor.users.findOne({
         "services.password.reset.token": token});
-      if (!user)
+      if (!user) {
         throw new Meteor.Error(403, "Token expired");
-      var when = user.services.password.reset.when;
-      var tokenLifetimeMs = Accounts._getPasswordResetTokenLifetimeMs();
-      var currentTimeMs = Date.now();
+      }
+      const { when, reason, email } = user.services.password.reset;
+      let tokenLifetimeMs = Accounts._getPasswordResetTokenLifetimeMs();
+      if (reason === "enroll") {
+        tokenLifetimeMs = Accounts._getPasswordEnrollTokenLifetimeMs();
+      }
+      const currentTimeMs = Date.now();
       if ((currentTimeMs - when) > tokenLifetimeMs)
         throw new Meteor.Error(403, "Token expired");
-      var email = user.services.password.reset.email;
-      if (!_.include(_.pluck(user.emails || [], 'address'), email))
+      if (!(pluckAddresses(user.emails).includes(email)))
         return {
           userId: user._id,
           error: new Meteor.Error(403, "Token has invalid email address")
         };
 
-      var hashed = hashPassword(newPassword);
+      const hashed = hashPassword(newPassword);
 
       // NOTE: We're about to invalidate tokens on the user, who we might be
       // logged in as. Make sure to avoid logging ourselves out if this
       // happens. But also make sure not to leave the connection in a state
       // of having a bad token set if things fail.
-      var oldToken = Accounts._getLoginToken(self.connection.id);
-      Accounts._setLoginToken(user._id, self.connection, null);
-      var resetToOldToken = function () {
-        Accounts._setLoginToken(user._id, self.connection, oldToken);
-      };
+      const oldToken = Accounts._getLoginToken(this.connection.id);
+      Accounts._setLoginToken(user._id, this.connection, null);
+      const resetToOldToken = () =>
+        Accounts._setLoginToken(user._id, this.connection, oldToken);
 
       try {
         // Update the user record by:
         // - Changing the password to the new one
         // - Forgetting about the reset token that was just used
         // - Verifying their email, since they got the password reset via email.
-        var affectedRecords = Meteor.users.update(
+        const affectedRecords = Meteor.users.update(
           {
             _id: user._id,
             'emails.address': email,
@@ -735,103 +859,52 @@ Meteor.methods({resetPassword: function (token, newPassword) {
  * @locus Server
  * @param {String} userId The id of the user to send email to.
  * @param {String} [email] Optional. Which address of the user's to send the email to. This address must be in the user's `emails` list. Defaults to the first unverified email in the list.
+ * @param {Object} [extraTokenData] Optional additional data to be added into the token record.
+ * @returns {Object} Object with {email, user, token, url, options} values.
  * @importFromPackage accounts-base
  */
-Accounts.sendVerificationEmail = function (userId, address) {
+Accounts.sendVerificationEmail = (userId, email, extraTokenData) => {
   // XXX Also generate a link using which someone can delete this
   // account if they own said address but weren't those who created
   // this account.
 
-  // Make sure the user exists, and address is one of their addresses.
-  var user = Meteor.users.findOne(userId);
-  if (!user)
-    throw new Error("Can't find user");
-  // pick the first unverified address if we weren't passed an address.
-  if (!address) {
-    var email = _.find(user.emails || [],
-                       function (e) { return !e.verified; });
-    address = (email || {}).address;
-
-    if (!address) {
-      throw new Error("That user has no unverified email addresses.");
-    }
-  }
-  // make sure we have a valid address
-  if (!address || !_.contains(_.pluck(user.emails || [], 'address'), address))
-    throw new Error("No such email address for user.");
-
-
-  var tokenRecord = {
-    token: Random.secret(),
-    address: address,
-    when: new Date()};
-  Meteor.users.update(
-    {_id: userId},
-    {$push: {'services.email.verificationTokens': tokenRecord}});
-
-  // before passing to template, update user object with new token
-  Meteor._ensure(user, 'services', 'email');
-  if (!user.services.email.verificationTokens) {
-    user.services.email.verificationTokens = [];
-  }
-  user.services.email.verificationTokens.push(tokenRecord);
-
-  var verifyEmailUrl = Accounts.urls.verifyEmail(tokenRecord.token);
-
-  var options = {
-    to: address,
-    from: Accounts.emailTemplates.verifyEmail.from
-      ? Accounts.emailTemplates.verifyEmail.from(user)
-      : Accounts.emailTemplates.from,
-    subject: Accounts.emailTemplates.verifyEmail.subject(user)
-  };
-
-  if (typeof Accounts.emailTemplates.verifyEmail.text === 'function') {
-    options.text =
-      Accounts.emailTemplates.verifyEmail.text(user, verifyEmailUrl);
-  }
-
-  if (typeof Accounts.emailTemplates.verifyEmail.html === 'function')
-    options.html =
-      Accounts.emailTemplates.verifyEmail.html(user, verifyEmailUrl);
-
-  if (typeof Accounts.emailTemplates.headers === 'object') {
-    options.headers = Accounts.emailTemplates.headers;
-  }
-
+  const {email: realEmail, user, token} =
+    Accounts.generateVerificationToken(userId, email, extraTokenData);
+  const url = Accounts.urls.verifyEmail(token);
+  const options = Accounts.generateOptionsForEmail(realEmail, user, url, 'verifyEmail');
   Email.send(options);
+  return {email: realEmail, user, token, url, options};
 };
 
 // Take token from sendVerificationEmail, mark the email as verified,
 // and log them in.
-Meteor.methods({verifyEmail: function (token) {
-  var self = this;
+Meteor.methods({verifyEmail: function (...args) {
+  const token = args[0];
   return Accounts._loginMethod(
-    self,
+    this,
     "verifyEmail",
-    arguments,
+    args,
     "password",
-    function () {
+    () => {
       check(token, String);
 
-      var user = Meteor.users.findOne(
+      const user = Meteor.users.findOne(
         {'services.email.verificationTokens.token': token});
       if (!user)
         throw new Meteor.Error(403, "Verify email link expired");
 
-      var tokenRecord = _.find(user.services.email.verificationTokens,
-                               function (t) {
-                                 return t.token == token;
-                               });
+        const tokenRecord = user.services.email.verificationTokens.find(
+          t => t.token == token
+        );
       if (!tokenRecord)
         return {
           userId: user._id,
           error: new Meteor.Error(403, "Verify email link expired")
         };
 
-      var emailsRecord = _.find(user.emails, function (e) {
-        return e.address == tokenRecord.address;
-      });
+      const emailsRecord = user.emails.find(
+        e => e.address == tokenRecord.address
+      );
       if (!emailsRecord)
         return {
           userId: user._id,
@@ -866,16 +939,16 @@ Meteor.methods({verifyEmail: function (token) {
  * be marked as verified. Defaults to false.
  * @importFromPackage accounts-base
  */
-Accounts.addEmail = function (userId, newEmail, verified) {
+Accounts.addEmail = (userId, newEmail, verified) => {
   check(userId, NonEmptyString);
   check(newEmail, NonEmptyString);
   check(verified, Match.Optional(Boolean));
 
-  if (_.isUndefined(verified)) {
+  if (verified === void 0) {
     verified = false;
   }
 
-  var user = Meteor.users.findOne(userId);
+  const user = getUserById(userId);
   if (!user)
     throw new Meteor.Error(403, "User not found");
 
@@ -887,23 +960,26 @@ Accounts.addEmail = function (userId, newEmail, verified) {
   // then we are OK and (2) if this would create a conflict with other users
   // then there would already be a case-insensitive duplicate and we can't fix
   // that in this code anyway.
-  var caseInsensitiveRegExp =
-    new RegExp('^' + Meteor._escapeRegExp(newEmail) + '$', 'i');
+  const caseInsensitiveRegExp =
+    new RegExp(`^${Meteor._escapeRegExp(newEmail)}$`, 'i');
 
-  var didUpdateOwnEmail = _.any(user.emails, function(email, index) {
-    if (caseInsensitiveRegExp.test(email.address)) {
-      Meteor.users.update({
-        _id: user._id,
-        'emails.address': email.address
-      }, {$set: {
-        'emails.$.address': newEmail,
-        'emails.$.verified': verified
-      }});
-      return true;
-    }
-
-    return false;
-  });
+  const didUpdateOwnEmail = user.emails.reduce(
+    (prev, email) => {
+      if (caseInsensitiveRegExp.test(email.address)) {
+        Meteor.users.update({
+          _id: user._id,
+          'emails.address': email.address
+        }, {$set: {
+          'emails.$.address': newEmail,
+          'emails.$.verified': verified
+        }});
+        return true;
+      } else {
+        return prev;
+      }
+    }, 
+    false
+  );
 
   // In the other updates below, we have to do another call to
   // checkForCaseInsensitiveDuplicates to make sure that no conflicting values
@@ -950,11 +1026,11 @@ Accounts.addEmail = function (userId, newEmail, verified) {
  * @param {String} email The email address to remove.
  * @importFromPackage accounts-base
  */
-Accounts.removeEmail = function (userId, email) {
+Accounts.removeEmail = (userId, email) => {
   check(userId, NonEmptyString);
   check(email, NonEmptyString);
 
-  var user = Meteor.users.findOne(userId);
+  const user = getUserById(userId);
   if (!user)
     throw new Meteor.Error(403, "User not found");
 
@@ -971,7 +1047,7 @@ Accounts.removeEmail = function (userId, email) {
 // does the actual user insertion.
 //
 // returns the user id
-var createUser = function (options) {
+const createUser = options => {
   // Unknown keys allowed, because a onCreateUserHook can take arbitrary
   // options.
   check(options, Match.ObjectIncluding({
@@ -980,14 +1056,13 @@ var createUser = function (options) {
     password: Match.Optional(passwordValidator)
   }));
 
-  var username = options.username;
-  var email = options.email;
+  const { username, email, password } = options;
   if (!username && !email)
     throw new Meteor.Error(400, "Need to set a username or email");
 
-  var user = {services: {}};
-  if (options.password) {
-    var hashed = hashPassword(options.password);
+  const user = {services: {}};
+  if (password) {
+    const hashed = hashPassword(password);
     user.services.password = { bcrypt: hashed };
   }
 
@@ -1000,7 +1075,7 @@ var createUser = function (options) {
   checkForCaseInsensitiveDuplicates('username', 'Username', username);
   checkForCaseInsensitiveDuplicates('emails.address', 'Email', email);
 
-  var userId = Accounts.insertUserDoc(options, user);
+  const userId = Accounts.insertUserDoc(options, user);
   // Perform another check after insert, in case a matching user has been
   // inserted in the meantime
   try {
@@ -1015,14 +1090,14 @@ var createUser = function (options) {
 };
 
 // method for create user. Requests come from the client.
-Meteor.methods({createUser: function (options) {
-  var self = this;
+Meteor.methods({createUser: function (...args) {
+  const options = args[0];
   return Accounts._loginMethod(
-    self,
+    this,
     "createUser",
-    arguments,
+    args,
     "password",
-    function () {
+    () => {
       // createUser() above does more checking.
       check(options, Object);
       if (Accounts._options.forbidClientAccountCreation)
@@ -1031,7 +1106,7 @@ Meteor.methods({createUser: function (options) {
         };
 
       // Create user. result contains id and token.
-      var userId = createUser(options);
+      const userId = createUser(options);
       // safety belt. createUser is supposed to throw on error. send 500 error
       // instead of sending a verification email with empty userid.
       if (! userId)
@@ -1061,8 +1136,8 @@ Meteor.methods({createUser: function (options) {
 // true", which we want to prevent the client from setting, but which a custom
 // method calling Accounts.createUser could set?
 //
-Accounts.createUser = function (options, callback) {
-  options = _.clone(options);
+Accounts.createUser = (options, callback) => {
+  options = { ...options };
 
   // XXX allow an optional callback?
   if (callback) {

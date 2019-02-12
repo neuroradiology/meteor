@@ -14,54 +14,64 @@ selftest.define("argument parsing", function () {
   // bad command
   run = s.run("aoeuasdf");
   run.matchErr("not a Meteor command");
+  run.waitSecs(5);
   run.expectExit(1);
 
   // bad subcommand
   run = s.run("admin", "aoeuasdf");
   run.matchErr("not a Meteor command");
+  run.waitSecs(5);
   run.expectExit(1);
 
   // missing subcommand
   run = s.run("admin");
   run.matchErr("for available commands");
+  run.waitSecs(5);
   run.expectExit(1);
 
   // conflicting command-like options
   run = s.run("aoeuasdf", "--version");
-  run.waitSecs(5);
   run.matchErr("pass anything else along with --version");
+  run.waitSecs(5);
   run.expectExit(1);
 
   run = s.run("--arch", "--version");
   run.matchErr("pass anything else");
+  run.waitSecs(5);
   run.expectExit(1);
 
   run = s.run("run", "--version");
   run.matchErr("pass anything else");
+  run.waitSecs(5);
   run.expectExit(1);
 
   run = s.run("--arch", "--arch");
   run.matchErr("more than once");
+  run.waitSecs(5);
   run.expectExit(1);
 
   // --release takes exactly one value
   run = s.run("--release");
   run.matchErr("needs a value");
+  run.waitSecs(5);
   run.expectExit(1);
 
   run = s.run("--release", "abc", "--release", "def");
   run.matchErr("should only be passed once");
+  run.waitSecs(5);
   run.expectExit(1);
 
   // required option missing
   run = s.run("dummy");
   run.matchErr("option is required");
   run.matchErr("Usage: meteor dummy");
+  run.waitSecs(5);
   run.expectExit(1);
 
   // successful command invocation, correct parsing of arguments
   run = s.run("dummy", "--ething", "x");
   run.read('"x" "3000" none []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
@@ -71,32 +81,38 @@ selftest.define("argument parsing", function () {
   if (process.platform !== "win32") {
     run = s.run("dummy", "--ething", "");
     run.read('"" "3000" none []\n');
+    run.waitSecs(5);
     run.expectEnd();
     run.expectExit(0);
 
     run = s.run("dummy", "--ething", "x", "", "");
     run.read('"x" "3000" none ["",""]\n');
+    run.waitSecs(5);
     run.expectEnd();
     run.expectExit(0);
   }
 
   run = s.run("dummy", "--ething=");
   run.read('"" "3000" none []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "-e=");
   run.read('"" "3000" none []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "-");
   run.read('"x" "3000" none ["-"]\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "-e", "x");
   run.read('"x" "3000" none []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
@@ -104,42 +120,50 @@ selftest.define("argument parsing", function () {
   if (process.platform !== "win32") {
     run = s.run("dummy", "-e", "");
     run.read('"" "3000" none []\n');
+    run.waitSecs(5);
     run.expectEnd();
     run.expectExit(0);
   }
 
   run = s.run("dummy", "-exxx");
   run.read('"xxx" "3000" none []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "-");
   run.read('"-" "3000" none []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "--port", "1234", "--changed");
   run.read('"x" 1234 true []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "--port", "0", "true");
   run.read('"x" 0 none ["true"]\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "--port", "01234", "12", "0013");
   run.read('"x" 1234 none ["12","0013"]\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "--port", "1234", "--changed");
   run.read('"--port" "3000" true ["1234"]\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething=x=y=z", "-Up=3000");
   run.read('"x=y=z" 3000 none []\nurl\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
@@ -251,42 +275,50 @@ selftest.define("argument parsing", function () {
   // '--' to end parsing
   run = s.run("dummy", "--ething", "x", "--", "-p", "4000");
   run.read('"x" "3000" none ["-p","4000"]\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "--", "--changed", "--changed");
   run.read('"x" "3000" none ["--changed","--changed"]\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "--");
   run.read('"x" "3000" none []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   // compact short options
   run = s.run("dummy", "--ething", "x", "-p4000", "--changed");
   run.read('"x" 4000 true []\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "-UD", "--changed");
   run.read('"x" "3000" true []\nurl\n\delete\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "-UDp4000", "--changed");
   run.read('"x" 4000 true []\nurl\ndelete\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "-UDp4000", "--changed");
   run.read('"x" 4000 true []\nurl\ndelete\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
   run = s.run("dummy", "--ething", "x", "-UDp4000");
   run.read('"x" 4000 none []\nurl\ndelete\n');
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 
@@ -315,6 +347,45 @@ selftest.define("argument parsing", function () {
   s.createApp('myapp', 'standard-app');
   s.cd('myapp', function () {
     run = s.run("list");
+    run.waitSecs(60);
+    run.expectExit(0);
+  });
+
+  s.createApp("app-with-extra-packages", "extra-packages-option", {
+    dontPrepareApp: true
+  });
+  s.cd("app-with-extra-packages", function () {
+    run = s.run("--extra-packages", "extra-package-1, extra-package-2@=0.0.2");
+    run.waitSecs(60);
+    run.match("extra-package-1: foobar");
+    run.match("extra-package-2: barfoo");
+    run.stop();
+  });
+
+  s.createApp("app-with-extra-packages", "extra-packages-option", {
+    dontPrepareApp: true
+  });
+  s.cd("app-with-extra-packages", function () {
+    run = s.run("test",
+      "--extra-packages", "tmeasday:acceptance-test-driver, extra-package-1, extra-package-2@=0.0.2",
+      "--driver-package", "tmeasday:acceptance-test-driver");
+    run.waitSecs(60);
+    run.match("extra-package-1: foobar");
+    run.match("extra-package-2: barfoo");
+    run.stop();
+  });
+
+  s.createApp("app-with-extra-packages", "extra-packages-option", {
+    dontPrepareApp: true
+  });
+  s.cd("app-with-extra-packages", function () {
+    run = s.run("test-packages", "--once",
+      "--driver-package", "test-server-tests-in-console-once",
+      "--extra-packages", "extra-package-1, extra-package-2@=0.0.2",
+      "extra-package-1", "extra-package-2");
+    run.waitSecs(60);
+    run.match("extra-package-1 - example test");
+    run.match("extra-package-2 - example test");
     run.expectExit(0);
   });
 });
@@ -330,12 +401,14 @@ selftest.define("command-like options", function () {
     run.expectExit(1);
   } else {
     run.read(release.current.getDisplayName() + "\n");
+    run.waitSecs(5);
     run.expectEnd();
     run.expectExit(0);
   }
 
   run = s.run("--arch");
   run.read(archinfo.host() + "\n");
+  run.waitSecs(5);
   run.expectEnd();
   run.expectExit(0);
 });
@@ -372,7 +445,7 @@ selftest.define("rails reminders", function () {
   run.expectExit(1);
 });
 
-selftest.define("old cli tests (converted)", function () {
+selftest.skip.define("old cli tests (converted)", function () {
   var s = new Sandbox;
   var run;
 
@@ -391,7 +464,7 @@ selftest.define("old cli tests (converted)", function () {
   run = s.run("remove", "--help");
   run.match("Removes a package");
   run = s.run("list", "--help");
-  run.match("This will not list transitive dependencies");
+  run.match("Transitive dependencies are not listed unless");
   run = s.run("bundle", "--help");
   run.match("command has been deprecated");
   run = s.run("build", "--help");
@@ -523,3 +596,75 @@ selftest.define("old cli tests (converted)", function () {
   run.expectExit(0);
   files.unlink(files.pathJoin(s.cwd, 'settings.js'));
 });
+
+// Added to address https://github.com/meteor/meteor/issues/8897.
+selftest.define(
+  'meteor test-packages --test-app-path directory',
+  function () {
+    var s = new Sandbox();
+    var run;
+
+    // If test-app-path doesn't exist, it should be created.
+    var testAppPath = '/tmp/meteor_test_app_path';
+    files.rm_recursive(testAppPath);
+    selftest.expectFalse(files.exists(testAppPath));
+    s.createApp('test-app-path-app', 'package-tests', {
+      dontPrepareApp: true
+    });
+    s.cd('test-app-path-app/packages/say-something', function () {
+      run = s.run(
+        'test-packages',
+        '--once',
+        { 'test-app-path': testAppPath },
+        './'
+      );
+      run.match('Started');
+      selftest.expectTrue(files.exists(testAppPath));
+      run.stop();
+      files.rm_recursive(testAppPath);
+    });
+
+    // If test-app-path already exists, make sure that directory is used.
+    var testAppPath = '/tmp/meteor_test_app_path';
+    files.rm_recursive(testAppPath);
+    files.mkdir_p(testAppPath);
+    selftest.expectTrue(files.exists(testAppPath));
+    selftest.expectFalse(files.exists(testAppPath + '/.meteor'));
+    s.createApp('test-app-path-app', 'package-tests', {
+      dontPrepareApp: true
+    });
+    s.cd('test-app-path-app/packages/say-something', function () {
+      run = s.run(
+        'test-packages',
+        '--once',
+        { 'test-app-path': testAppPath },
+        './'
+      );
+      run.match('Started');
+      selftest.expectTrue(files.exists(testAppPath + '/.meteor'));
+      run.stop();
+      files.rm_recursive(testAppPath);
+    });
+
+    // If test-app-path already exists but is a file instead of a directory,
+    // show a console error message explaining this, and exit.
+    var testAppPath = '/tmp/meteor_test_app_path';
+    files.rm_recursive(testAppPath);
+    files.writeFile(testAppPath, '<3 meteor');
+    selftest.expectTrue(files.exists(testAppPath));
+    s.createApp('test-app-path-app', 'package-tests', {
+      dontPrepareApp: true
+    });
+    s.cd('test-app-path-app/packages/say-something', function () {
+      run = s.run(
+        'test-packages',
+        '--once',
+        { 'test-app-path': testAppPath },
+        './'
+      );
+      run.matchErr('is not a directory');
+      run.expectExit(1);
+      files.rm_recursive(testAppPath);
+    });
+  }
+);

@@ -1,27 +1,14 @@
 Package.describe({
   summary: "JavaScript minifier",
-  version: "1.2.14"
+  version: "2.4.0"
 });
 
 Npm.depends({
-  "uglify-js": "2.7.0"
-});
-
-Npm.strip({
-  "uglify-js": ["test/"]
+  terser: "3.9.2"
 });
 
 Package.onUse(function (api) {
-  api.use('underscore', 'server');
-  api.export(['UglifyJSMinify', 'UglifyJS']);
+  api.use('babel-compiler');
+  api.export(['meteorJsMinify']);
   api.addFiles(['minifier.js'], 'server');
-});
-
-Package.onTest(function (api) {
-  api.use('minifier-js', 'server');
-  api.use('tinytest');
-
-  api.addFiles([
-    'beautify-tests.js',
-  ], 'server');
 });

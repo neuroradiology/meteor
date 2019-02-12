@@ -6,25 +6,35 @@ var utils = require('../utils/utils.js');
 var watch = require('../fs/watch.js');
 var buildmessage = require('../utils/buildmessage.js');
 var meteorNpm = require('./meteor-npm.js');
-var NpmDiscards = require('./npm-discards.js');
 import Builder from './builder.js';
 var archinfo = require('../utils/archinfo.js');
 var catalog = require('../packaging/catalog/catalog.js');
 var packageVersionParser = require('../packaging/package-version-parser.js');
 var compiler = require('./compiler.js');
-var packageAPIModule = require('./package-api.js');
 var Profile = require('../tool-env/profile.js').Profile;
 
 import SourceArch from './source-arch.js';
+import { PackageNamespace } from "./package-namespace.js";
+import { PackageNpm } from "./package-npm.js";
+import { PackageCordova } from "./package-cordova.js";
+import { PackageAPI } from "./package-api.js";
 
 import {
   TEST_FILENAME_REGEXPS,
   APP_TEST_FILENAME_REGEXPS,
-  isTestFilePath } from './test-files.js';
+  isTestFilePath,
+} from './test-files.js';
 
 import {
   convert as convertColonsInPath
 } from '../utils/colon-converter.js';
+
+import {
+  optimisticReadFile,
+  optimisticHashOrNull,
+  optimisticStatOrNull,
+  optimisticReadMeteorIgnore,
+} from "../fs/optimistic.js";
 
 // XXX: This is a medium-term hack, to avoid having the user set a package name
 // & test-name in package.describe. We will change this in the new control file
@@ -59,6 +69,7 @@ var loadOrderSort = function (sourceProcessorSet, arch) {
 
     case 'wrong-arch':
     case 'unmatched':
+    case 'meteor-ignore':
       return false;
 
     default:
@@ -202,14 +213,13 @@ class SymlinkLoopChecker {
   constructor(sourceRoot) {
     this.sourceRoot = sourceRoot;
     this._seenPaths = {};
-    this._realpathCache = {};
   }
 
   check(relDir, quietly = true) {
     const absPath = files.pathJoin(this.sourceRoot, relDir);
 
     try {
-      var realPath = files.realpath(absPath, this._realpathCache);
+      var realPath = files.realpath(absPath);
     } catch (e) {
       if (!e || e.code !== 'ELOOP') {
         throw e;
@@ -288,7 +298,7 @@ var PackageSource = function () {
 
   // Files to be stripped from the installed NPM dependency tree. See the
   // Npm.strip comment below for further usage information.
-  self.npmDiscards = new NpmDiscards;
+  self.npmDiscards = null;
 
   // Absolute path to a directory on disk that serves as a cache for
   // the npm dependencies, so we don't have to fetch them on every
@@ -444,7 +454,7 @@ _.extend(PackageSource.prototype, {
   // - name: override the name of this package with a different name.
   // - buildingIsopackets: true if this is being scanned in the process
   //   of building isopackets
-  initFromPackageDir: function (dir, options) {
+  initFromPackageDir: Profile("PackageSource#initFromPackageDir", function (dir, options) {
     var self = this;
     buildmessage.assertInCapture();
     var isPortable = true;
@@ -484,21 +494,18 @@ _.extend(PackageSource.prototype, {
       throw new Error("putative package directory " + dir + " doesn't exist?");
     }
 
-    var fileAndDepLoader = null;
-    var npmDependencies = null;
-    var cordovaDependencies = null;
-
     const packageFileHashes = Object.create(null);
     const packageJsPath = files.pathJoin(self.sourceRoot, 'package.js');
-    const packageJsCode = files.readFile(packageJsPath);
-    packageFileHashes[packageJsPath] = watch.sha1(packageJsCode);
+    const packageJsCode = optimisticReadFile(packageJsPath);
+    packageFileHashes[packageJsPath] =
+      optimisticHashOrNull(packageJsPath);
 
     const pkgJsonPath = files.pathJoin(self.sourceRoot, 'package.json');
-    const pkgJsonStat = files.statOrNull(pkgJsonPath);
+    const pkgJsonStat = optimisticStatOrNull(pkgJsonPath);
     if (pkgJsonStat &&
         pkgJsonStat.isFile()) {
       packageFileHashes[pkgJsonPath] =
-        watch.sha1(files.readFile(pkgJsonPath));
+        optimisticHashOrNull(pkgJsonPath);
     }
 
     function watchPackageFiles(watchSet) {
@@ -513,10 +520,6 @@ _.extend(PackageSource.prototype, {
     // an asset.
     watchPackageFiles(self.pluginWatchSet);
 
-    var hasTests = false;
-
-    // == 'Package' object visible in package.js ==
-
     /**
      * @global
      * @name  Package
@@ -524,476 +527,26 @@ _.extend(PackageSource.prototype, {
      * @namespace
      * @locus package.js
      */
-    var Package = {
-      // Set package metadata. Options:
-      // - summary: for 'meteor list' & package server
-      // - version: package version string
-      // There used to be a third option documented here,
-      // 'environments', but it was never implemented and no package
-      // ever used it.
-
-      /**
-       * @summary Provide basic package information.
-       * @locus package.js
-       * @memberOf Package
-       * @param {Object} options
-       * @param {String} options.summary A concise 1-2 sentence description of
-       * the package, required for publication.
-       * @param {String} options.version The (extended)
-       * [semver](http://www.semver.org) version for your package. Additionally,
-       * Meteor allows a wrap number: a positive integer that follows the
-       * version number. If you are porting another package that uses semver
-       * versioning, you may want to use the original version, postfixed with
-       * `_wrapnumber`. For example, `1.2.3_1` or `2.4.5-rc1_4`. Wrap numbers
-       * sort after the original numbers: `1.2.3` < `1.2.3_1` < `1.2.3_2` <
-       * `1.2.4-rc.0`. If no version is specified, this field defaults to
-       * `0.0.0`. If you want to publish your package to the package server, you
-       * must specify a version.
-       * @param {String} options.name Optional name override. By default, the
-       * package name comes from the name of its directory.
-       * @param {String} options.git Optional Git URL to the source repository.
-       * @param {String} options.documentation Optional Filepath to
-       * documentation. Set to 'README.md' by default. Set this to null to submit
-       * no documentation.
-       * @param {Boolean} options.debugOnly A package with this flag set to true
-       * will not be bundled into production builds. This is useful for packages
-       * meant to be used in development only.
-       * @param {Boolean} options.prodOnly A package with this flag set to true
-       * will ONLY be bundled into production builds.
-       * @param {Boolean} options.testOnly A package with this flag set to true
-       * will ONLY be bundled as part of `meteor test`.
-       */
-      describe: function (options) {
-        _.each(options, function (value, key) {
-          if (key === "summary" ||
-              key === "git") {
-            self.metadata[key] = value;
-          } else if (key === "documentation") {
-            self.metadata[key] = value;
-            self.docsExplicitlyProvided = true;
-          } else if (key === "version") {
-            if (typeof(value) !== "string") {
-              buildmessage.error("The package version (specified with "
-                                 + "Package.describe) must be a string.");
-              // Recover by pretending that version was not set.
-            } else {
-              var goodVersion = true;
-              try {
-                var parsedVersion = packageVersionParser.getValidServerVersion(
-                  value);
-              } catch (e) {
-                if (!e.versionParserError) {
-                  throw e;
-                }
-                buildmessage.error(
-                  "The package version " + value + " (specified with Package.describe) "
-                    + "is not a valid Meteor package version.\n"
-                    + "Valid package versions are semver (see http://semver.org/), "
-                    + "optionally followed by '_' and an integer greater or equal to 1.");
-                goodVersion = false;
-              }
-              // Recover by pretending that the version was not set.
-            }
-            if (goodVersion && parsedVersion !== value) {
-              buildmessage.error(
-                "The package version (specified with Package.describe) may not "
-                  + "contain a plus-separated build ID.");
-              // Recover by pretending that the version was not set.
-              goodVersion = false;
-            }
-            if (goodVersion) {
-              self.version = value;
-              self.versionExplicitlyProvided = true;
-            }
-          } else if (key === "name" && !self.isTest) {
-            if (!self.name) {
-              self.name = value;
-            } else if (self.name !== value) {
-              // Woah, so we requested a non-test package by name, and it is not
-              // the name that we find inside. That's super weird.
-              buildmessage.error(
-                "trying to initialize a nonexistent base package " + value);
-            }
-            // `debugOnly`, `prodOnly` and `testOnly` are boolean
-            // flags you can put on a package, currently undocumented.
-            // when set to true, they cause a package's code to be
-            // only included (i.e. linked into the bundle) in dev
-            // mode, prod mode (`meteor --production`) or app tests
-            // (`meteor test`), and excluded otherwise.
-            //
-            // Notes:
-            //
-            // * These flags do not affect which packages or which versions are
-            //   are selected by the version solver.
-            //
-            // * When you use a debugOnly, prodOnly or testOnly
-            //   package, its exports are not imported for you.  You
-            //   have to access them using
-            //   `Package["my-package"].MySymbol`.
-            //
-            // * These flags CAN cause different package load orders in
-            //   development and production!  We should probably fix this.
-            //   Basically, packages that are excluded from the build using
-            //   these flags are also excluded fro the build order calculation,
-            //   and that's the problem
-            //
-            // * We should consider publicly documenting these flags, since they
-            //   are effectively part of the public API.
-          } else if (key === "debugOnly") {
-            self.debugOnly = !!value;
-          } else if (key === "prodOnly") {
-            self.prodOnly = !!value;
-          } else if (key === "testOnly") {
-            self.testOnly = !!value;
-          } else {
-            // Do nothing. We might want to add some keys later, and we should err
-            // on the side of backwards compatibility.
-          }
-          if (_.size(_.compact([self.debugOnly, self.prodOnly, self.testOnly])) > 1) {
-            buildmessage.error(
-              "Package can't have more than one of: debugOnly, prodOnly, testOnly.");
-          }
-        });
-      },
-
-      /**
-       * @summary Define package dependencies and expose package methods.
-       * @locus package.js
-       * @memberOf Package
-       * @param {Function} func A function that takes in the package control `api` object, which keeps track of dependencies and exports.
-       */
-      onUse: function (f) {
-        if (!self.isTest) {
-          if (fileAndDepLoader) {
-            buildmessage.error("duplicate onUse handler; a package may have " +
-                               "only one", { useMyCaller: true });
-            // Recover by ignoring the duplicate
-            return;
-          }
-          fileAndDepLoader = f;
-        }
-      },
-
-      /**
-       * @deprecated in 0.9.0
-       */
-      on_use: function (f) {
-        this.onUse(f);
-      },
-
-      /**
-       * @summary Define dependencies and expose package methods for unit tests.
-       * @locus package.js
-       * @memberOf Package
-       * @param {Function} func A function that takes in the package control 'api' object, which keeps track of dependencies and exports.
-       */
-      onTest: function (f) {
-        // If we are not initializing the test package, then we are initializing
-        // the normal package and have now noticed that it has tests. So, let's
-        // register the test. This is a medium-length hack until we have new
-        // control files.
-        if (!self.isTest) {
-          hasTests = true;
-          return;
-        }
-
-        // We are initializing the test, so proceed as normal.
-        if (self.isTest) {
-          if (fileAndDepLoader) {
-            buildmessage.error("duplicate onTest handler; a package may have " +
-                               "only one", { useMyCaller: true });
-            // Recover by ignoring the duplicate
-            return;
-          }
-          fileAndDepLoader = f;
-        }
-      },
-
-      /**
-       * @deprecated in 0.9.0
-       */
-      on_test: function (f) {
-        this.onTest(f);
-      },
-
-      // Define a plugin. A plugin extends the build process for
-      // targets that use this package. For example, a Coffeescript
-      // compiler would be a plugin. A plugin is its own little
-      // program, with its own set of source files, used packages, and
-      // npm dependencies.
-      //
-      // This is an experimental API and for now you should assume
-      // that it will change frequently and radically (thus the
-      // '_transitional_'). For maximum R&D velocity and for the good
-      // of the platform, we will push changes that break your
-      // packages that use this API. You've been warned.
-      //
-      // Options:
-      // - name: a name for this plugin. required (cosmetic -- string)
-      // - use: package to use for the plugin (names, as strings)
-      // - sources: sources for the plugin (array of string)
-      // - npmDependencies: map from npm package name to required
-      //   version (string)
-
-      /**
-       * @summary Define a build plugin. A build plugin extends the build
-       * process for apps and packages that use this package. For example,
-       * the `coffeescript` package uses a build plugin to compile CoffeeScript
-       * source files into JavaScript.
-       * @param  {Object} [options]
-       * @param {String} options.name A cosmetic name, must be unique in the
-       * package.
-       * @param {String|String[]} options.use Meteor packages that this
-       * plugin uses, independent of the packages specified in
-       * [api.onUse](#pack_onUse).
-       * @param {String[]} options.sources The source files that make up the
-       * build plugin, independent from [api.addFiles](#pack_addFiles).
-       * @param {Object} options.npmDependencies An object where the keys
-       * are NPM package names, and the values are the version numbers of
-       * required NPM packages, just like in [Npm.depends](#Npm-depends).
-       * @memberOf Package
-       * @locus package.js
-       */
-      registerBuildPlugin: function (options) {
-        // Tests don't have plugins; plugins initialized in the control file
-        // belong to the package and not to the test. (This will be less
-        // confusing in the new control file format).
-        if (self.isTest) {
-          return;
-        }
-
-        if (! ('name' in options)) {
-          buildmessage.error("build plugins require a name",
-                             { useMyCaller: true });
-          // recover by ignoring plugin
-          return;
-        }
-
-        if (options.name in self.pluginInfo) {
-          buildmessage.error("this package already has a plugin named '" +
-                             options.name + "'",
-                             { useMyCaller: true });
-          // recover by ignoring plugin
-          return;
-        }
-
-        if (options.name.match(/\.\./) || options.name.match(/[\\\/]/)) {
-          buildmessage.error("bad plugin name", { useMyCaller: true });
-          // recover by ignoring plugin
-          return;
-        }
-
-        // XXX probably want further type checking
-        self.pluginInfo[options.name] = options;
-      },
-
-      /**
-       * @deprecated in 0.9.4
-       */
-      _transitional_registerBuildPlugin: function (options) {
-        this.registerBuildPlugin(options);
-      },
-
-      includeTool: function () {
-        if (!files.inCheckout()) {
-          buildmessage.error("Package.includeTool() can only be used with a " +
-                             "checkout of meteor");
-        } else if (self.includeTool) {
-          buildmessage.error("Duplicate includeTool call");
-        } else {
-          self.includeTool = true;
-        }
-      }
-    };
-
-    // == 'Npm' object visible in package.js ==
+    const Package = new PackageNamespace(this);
 
     /**
      * @namespace Npm
      * @global
      * @summary The Npm object in package.js and package source files.
      */
-    var Npm = {
-      /**
-       * @summary Specify which [NPM](https://www.npmjs.org/) packages
-       * your Meteor package depends on.
-       * @param  {Object} dependencies An object where the keys are package
-       * names and the values are one of:
-       *   1. Version numbers in string form
-       *   2. Http(s) URLs to a git commit by SHA.   
-       *   3. Git URLs in the format described [here](https://docs.npmjs.com/files/package.json#git-urls-as-dependencies)
-       *
-       * Https URL example:
-       *
-       * ```js
-       * Npm.depends({
-       *   moment: "2.8.3",
-       *   async: "https://github.com/caolan/async/archive/71fa2638973dafd8761fa5457c472a312cc820fe.tar.gz"
-       * });
-       * ```
-       *
-       * Git URL example:
-       *
-       * ```js
-       * Npm.depends({
-       *   moment: "2.8.3",
-       *   async: "git+https://github.com/caolan/async#master"
-       * });
-       * ```
-       * @locus package.js
-       * @memberOf  Npm
-       */
-      depends: function (_npmDependencies) {
-        // XXX make npmDependencies be separate between use and test, so that
-        // production doesn't have to ship all of the npm modules used by test
-        // code
-        if (npmDependencies) {
-          buildmessage.error("Npm.depends may only be called once per package",
-                             { useMyCaller: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-        if (typeof _npmDependencies !== 'object') {
-          buildmessage.error("the argument to Npm.depends should be an " +
-                             "object, like this: {gcd: '0.0.0'}",
-                             { useMyCaller: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-
-        // don't allow npm fuzzy versions so that there is complete
-        // consistency when deploying a meteor app
-        //
-        // XXX use something like seal or lockdown to have *complete*
-        // confidence we're running the same code?
-        try {
-          utils.ensureOnlyValidVersions(_npmDependencies, {forCordova: false});
-        } catch (e) {
-          buildmessage.error(e.message, { useMyCaller: true, downcase: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-
-        npmDependencies = _npmDependencies;
-      },
-
-      // The `Npm.strip` method makes up for packages that have missing
-      // or incomplete .npmignore files by telling the bundler to strip out
-      // certain unnecessary files and/or directories during `meteor build`.
-      //
-      // The `discards` parameter should be an object whose keys are
-      // top-level package names and whose values are arrays of strings
-      // (or regular expressions) that match paths in that package's
-      // directory that should be stripped before installation. For
-      // example:
-      //
-      //   Npm.strip({
-      //     connect: [/*\.wmv$/],
-      //     useragent: ["tests/"]
-      //   });
-      //
-      // This means (1) "remove any files with the `.wmv` extension from
-      // the 'connect' package directory" and (2) "remove the 'tests'
-      // directory from the 'useragent' package directory."
-      strip: function(discards) {
-        self.npmDiscards.merge(discards);
-      },
-
-      require: function (name) {
-        try {
-          return require(name); // from the dev bundle
-        } catch (e) {
-          buildmessage.error(
-            "can't find npm module '" + name +
-              "'. In package.js, Npm.require can only find built-in modules.",
-            { useMyCaller: true });
-          // recover by, uh, returning undefined, which is likely to
-          // have some knock-on effects
-          return undefined;
-        }
-      }
-    };
-
-    // == 'Cordova' object visible in package.js ==
+    const Npm = new PackageNpm();
 
     /**
      * @namespace Cordova
      * @global
      * @summary The Cordova object in package.js.
      */
-    var Cordova = {
-      /**
-       * @summary Specify which [Cordova / PhoneGap](http://cordova.apache.org/)
-       * plugins your Meteor package depends on.
-       *
-       * Plugins are installed from
-       * [plugins.cordova.io](http://plugins.cordova.io/), so the plugins and
-       * versions specified must exist there. Alternatively, the version
-       * can be replaced with a GitHub tarball URL as described in the
-       * [Cordova](https://github.com/meteor/meteor/wiki/Meteor-Cordova-integration#meteor-packages-with-cordova-dependencies)
-       * page of the Meteor wiki on GitHub.
-       * @param  {Object} dependencies An object where the keys are plugin
-       * names and the values are version numbers or GitHub tarball URLs
-       * in string form.
-       * Example:
-       *
-       * ```js
-       * Cordova.depends({
-       *   "org.apache.cordova.camera": "0.3.0"
-       * });
-       * ```
-       *
-       * Alternatively, with a GitHub URL:
-       *
-       * ```js
-       * Cordova.depends({
-       *   "org.apache.cordova.camera":
-       *     "https://github.com/apache/cordova-plugin-camera/tarball/d84b875c449d68937520a1b352e09f6d39044fbf"
-       * });
-       * ```
-       *
-       * @locus package.js
-       * @memberOf  Cordova
-       */
-      depends: function (_cordovaDependencies) {
-        // XXX make cordovaDependencies be separate between use and test, so that
-        // production doesn't have to ship all of the npm modules used by test
-        // code
-        if (cordovaDependencies) {
-          buildmessage.error("Cordova.depends may only be called once per package",
-                             { useMyCaller: true });
-          // recover by ignoring the Cordova.depends line
-          return;
-        }
-        if (typeof _cordovaDependencies !== 'object') {
-          buildmessage.error("the argument to Cordova.depends should be an " +
-                             "object, like this: {gcd: '0.0.0'}",
-                             { useMyCaller: true });
-          // recover by ignoring the Cordova.depends line
-          return;
-        }
-
-        // don't allow cordova fuzzy versions so that there is complete
-        // consistency when deploying a meteor app
-        //
-        // XXX use something like seal or lockdown to have *complete*
-        // confidence we're running the same code?
-        try {
-          utils.ensureOnlyValidVersions(_cordovaDependencies, {forCordova: true});
-        } catch (e) {
-          buildmessage.error(e.message, { useMyCaller: true, downcase: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-
-        cordovaDependencies = _cordovaDependencies;
-      },
-    };
+    const Cordova = new PackageCordova();
 
     try {
       files.runJavaScript(packageJsCode.toString('utf8'), {
         filename: 'package.js',
-        symbols: { Package: Package, Npm: Npm, Cordova: Cordova }
+        symbols: { Package, Npm, Cordova }
       });
     } catch (e) {
       buildmessage.exception(e);
@@ -1004,10 +557,10 @@ _.extend(PackageSource.prototype, {
       // out to feel pretty disconcerting -- definitely violates the
       // principle of least surprise.) Leave the metadata if we have
       // it, though.
-      fileAndDepLoader = null;
+      Package._fileAndDepLoader = null;
       self.pluginInfo = {};
-      npmDependencies = null;
-      cordovaDependencies = null;
+      Npm._dependencies = null;
+      Cordova._dependencies = null;
     }
 
     // In the past, we did not require a Package.Describe.name field. So, it is
@@ -1060,13 +613,13 @@ _.extend(PackageSource.prototype, {
     // probably is sufficient for virtually all packages that actually
     // exist in the field, if not every single one. #OldStylePackageSupport
 
-    var api = new packageAPIModule.PackageAPI({
-      buildingIsopackets: !!initFromPackageDirOptions.buildingIsopackets
+    var api = new PackageAPI({
+      buildingIsopackets: !! initFromPackageDirOptions.buildingIsopackets
     });
 
-    if (fileAndDepLoader) {
+    if (Package._fileAndDepLoader) {
       try {
-        buildmessage.markBoundary(fileAndDepLoader)(api);
+        buildmessage.markBoundary(Package._fileAndDepLoader)(api);
       } catch (e) {
         console.log(e.stack); // XXX should we keep this here -- or do we want broken
                               // packages to fail silently?
@@ -1084,10 +637,10 @@ _.extend(PackageSource.prototype, {
           };
         });
 
-        fileAndDepLoader = null;
+        Package._fileAndDepLoader = null;
         self.pluginInfo = {};
-        npmDependencies = null;
-        cordovaDependencies = null;
+        Npm._dependencies = null;
+        Cordova._dependencies = null;
       }
     }
 
@@ -1173,9 +726,10 @@ _.extend(PackageSource.prototype, {
     // dirs for use vs test?
     self.npmCacheDirectory =
       files.pathResolve(files.pathJoin(self.sourceRoot, '.npm', 'package'));
-    self.npmDependencies = npmDependencies;
+    self.npmDependencies = Npm._dependencies;
+    self.npmDiscards = Npm._discards;
 
-    self.cordovaDependencies = cordovaDependencies;
+    self.cordovaDependencies = Cordova._dependencies;
 
     // Create source architectures, one for the server and one for each web
     // arch.
@@ -1213,13 +767,13 @@ _.extend(PackageSource.prototype, {
         implies: api.implies[arch],
         getFiles(sourceProcessorSet, watchSet) {
           const result = api.files[arch];
-          const relPathToSourceObj = {};
+          const relPathToSourceObj = Object.create(null);
           const sources = result.sources;
 
           // Files explicitly passed to api.addFiles remain at the
           // beginning of api.files[arch].sources in their given order.
-          sources.forEach(sourceObj => {
-            relPathToSourceObj[sourceObj.relPath] = sourceObj;
+          sources.forEach(source => {
+            relPathToSourceObj[source.relPath] = source;
           });
 
           self._findSources({
@@ -1228,11 +782,21 @@ _.extend(PackageSource.prototype, {
             sourceArch: this,
             isApp: false
           }).forEach(relPath => {
-            if (! _.has(relPathToSourceObj, relPath)) {
-              const fileOptions = self._inferFileOptions(relPath, {
-                arch,
-                isApp: false,
-              });
+            const source = relPathToSourceObj[relPath];
+
+            if (source) {
+              const fileOptions = source.fileOptions ||
+                (source.fileOptions = Object.create(null));
+
+              // Since this file was explicitly added with api.addFiles or
+              // api.mainModule, it should be loaded eagerly unless the
+              // caller specified a boolean fileOptions.lazy value.
+              if (typeof fileOptions.lazy !== "boolean") {
+                fileOptions.lazy = false;
+              }
+
+            } else {
+              const fileOptions = Object.create(null);
 
               // Since this file was not explicitly added with
               // api.addFiles, it should not be evaluated eagerly.
@@ -1256,10 +820,10 @@ _.extend(PackageSource.prototype, {
     self.serveRoot = files.pathJoin('/packages/', self.name);
 
     // Name of the test.
-    if (hasTests) {
+    if (Package._hasTests) {
       self.testName = genTestName(self.name);
     }
-  },
+  }),
 
   _readAndWatchDirectory(relDir, watchSet, {include, exclude, names}) {
     return watch.readAndWatchDirectory(watchSet, {
@@ -1284,7 +848,15 @@ _.extend(PackageSource.prototype, {
                   constraint: constraint.constraintString });
     });
 
-    var projectWatchSet = projectContext.getProjectWatchSet();
+    const projectWatchSet = projectContext.getProjectWatchSet();
+
+    const mainModulesByArch =
+      projectContext.meteorConfig.getMainModulesByArch();
+
+    const testModulesByArch =
+      projectContext.meteorConfig.getTestModulesByArch();
+
+    projectWatchSet.merge(projectContext.meteorConfig.watchSet);
 
     _.each(compiler.ALL_ARCHES, function (arch) {
       // We don't need to build a Cordova SourceArch if there are no Cordova
@@ -1293,6 +865,12 @@ _.extend(PackageSource.prototype, {
           _.isEmpty(projectContext.platformList.getCordovaPlatforms())) {
         return;
       }
+
+      const mainModule = projectContext.meteorConfig
+        .getMainModuleForArch(arch, mainModulesByArch);
+
+      const testModule = projectContext.meteorConfig
+        .getTestModuleForArch(arch, testModulesByArch);
 
       // XXX what about /web.browser/* etc, these directories could also
       // be for specific client targets.
@@ -1312,23 +890,45 @@ _.extend(PackageSource.prototype, {
             sourceArch: this,
             ignoreFiles,
             isApp: true,
-            loopChecker: new SymlinkLoopChecker(self.sourceRoot)
+            testModule,
           };
 
-          return {
-            sources: self._findSources(findOptions).sort(
-              loadOrderSort(sourceProcessorSet, arch)
-            ).map(relPath => {
-              return {
-                relPath,
-                fileOptions: self._inferFileOptions(relPath, {
-                  arch,
-                  isApp: true,
-                }),
-              };
-            }),
+          // If this architecture has a mainModule defined in
+          // package.json, it's an error if _findSources doesn't find that
+          // module. If no mainModule is defined, anything goes.
+          let missingMainModule = !! mainModule;
 
-            assets: self._findAssets(findOptions),
+          const sources = self._findSources(findOptions).sort(
+            loadOrderSort(sourceProcessorSet, arch)
+          ).map(relPath => {
+            if (relPath === mainModule) {
+              missingMainModule = false;
+            }
+
+            const fileOptions = self._inferAppFileOptions(relPath, {
+              arch,
+              mainModule,
+              testModule,
+            });
+
+            return {
+              relPath,
+              fileOptions,
+            };
+          });
+
+          if (missingMainModule) {
+            buildmessage.error([
+              "Could not find mainModule for '" + arch + "' architecture: " + mainModule,
+              'Check the "meteor" section of your package.json file?'
+            ].join("\n"));
+          }
+
+          const assets = self._findAssets(findOptions);
+
+          return {
+            sources,
+            assets,
           };
         }
       });
@@ -1367,18 +967,50 @@ _.extend(PackageSource.prototype, {
     }
   }),
 
-  _inferFileOptions(relPath, {arch, isApp}) {
-    const fileOptions = {};
-    const isTest = global.testCommandMetadata
-      && global.testCommandMetadata.isTest;
-    const isAppTest = global.testCommandMetadata
-      && global.testCommandMetadata.isAppTest;
-    const isTestFile = (isTest || isAppTest) && isTestFilePath(relPath);
+  _inferAppFileOptions(relPath, {
+    arch,
+    mainModule,
+    testModule,
+  }) {
+    const fileOptions = Object.create(null);
+    const {
+      isTest = false,
+      isAppTest = false,
+    } = global.testCommandMetadata || {};
+
+    let isTestFile = false;
+    if (isTest || isAppTest) {
+      if (typeof testModule === "undefined") {
+        // If a testModule was not configured in the "meteor" section of
+        // package.json for this architecture, then isTestFilePath should
+        // determine whether this file loads eagerly.
+        isTestFile = isTestFilePath(relPath);
+      } else if (relPath === testModule) {
+        // If testModule is a string === relPath, then it is the entry
+        // point for tests, and should be loaded eagerly.
+        isTestFile = true;
+        fileOptions.lazy = false;
+        fileOptions.testModule = true;
+      } else {
+        // If testModule was defined but !== relPath, this file should not
+        // be loaded eagerly during tests. Setting fileOptions.testModule
+        // to false indicates that a testModule was configured, but this
+        // was not it. ResourceSlot#_isLazy (in compiler-plugin.js) will
+        // use this information (together with fileOptions.mainModule) to
+        // make the final call as to whether this file should be loaded
+        // eagerly or lazily.
+        isTestFile = false;
+        fileOptions.testModule = false;
+      }
+    }
 
     // If running in test mode (`meteor test`), all files other than
     // test files should be loaded lazily.
-    if (isTest && !isTestFile) {
+    if (isTest && ! isTestFile) {
       fileOptions.lazy = true;
+      // Ignore any meteor.mainModule that was specified, since we're
+      // running `meteor test` without the --full-app option.
+      mainModule = void 0;
     }
 
     const dirs = files.pathDirname(relPath).split(files.pathSep);
@@ -1395,8 +1027,9 @@ _.extend(PackageSource.prototype, {
         return fileOptions;
       }
 
-      // Files in `imports/` should be lazily loaded *apart* from tests
-      if (isApp && dir === "imports" && !isTestFile) {
+      // Files in `imports/` and `tests/` directories should be lazily
+      // loaded *apart* from tests.
+      if ((dir === "imports" || dir === "tests") && ! isTestFile) {
         fileOptions.lazy = true;
       }
 
@@ -1415,10 +1048,26 @@ _.extend(PackageSource.prototype, {
       if (i > 0 &&
           dirs[i - 1] === "client" &&
           dir === "compatibility" &&
-          isApp && // Skip this check for packages.
           archinfo.matches(arch, "web") &&
           relPath.endsWith(".js")) {
         fileOptions.bare = true;
+      }
+    }
+
+    if (typeof mainModule !== "undefined") {
+      // Note: if mainModule === false, no JavaScript modules will be
+      // loaded eagerly unless explicitly added with !fileOptions.lazy by
+      // a compiler plugin. This can be useful for building an app that
+      // does not run any application JS on the client (or the server). Of
+      // course, Meteor packages may still run JS on startup, but they
+      // have their own rules for lazy/eager loading of modules.
+      if (relPath === mainModule) {
+        fileOptions.lazy = false;
+        fileOptions.mainModule = true;
+      } else {
+        // Used in ResourceSlot#_isLazy (in compiler-plugin.js) to make a
+        // final determination of whether the file should be lazy.
+        fileOptions.mainModule = false;
       }
     }
 
@@ -1429,11 +1078,12 @@ _.extend(PackageSource.prototype, {
   // complete list of source files for directories within node_modules.
   _findSourcesCache: Object.create(null),
 
-  _findSources({
+  _findSources: Profile("PackageSource#_findSources", function ({
     sourceProcessorSet,
     watchSet,
     isApp,
     sourceArch,
+    testModule,
     loopChecker = new SymlinkLoopChecker(this.sourceRoot),
     ignoreFiles = []
   }) {
@@ -1442,20 +1092,16 @@ _.extend(PackageSource.prototype, {
     const sourceReadOptions =
       sourceProcessorSet.appReadDirectoryOptions(arch);
 
+    // Adding, removing, or modifying a .meteorignore file should trigger
+    // a rebuild with the new rules applied.
+    sourceReadOptions.names.push(".meteorignore");
+
     // Ignore files starting with dot (unless they are explicitly in
-    // 'names').
+    // sourceReadOptions.names, e.g. .meteorignore, added above).
     sourceReadOptions.exclude.push(/^\./);
+
     // Ignore the usual ignorable files.
     sourceReadOptions.exclude.push(...ignoreFiles);
-
-    // Unless we're running tests, ignore all test filenames and if we are, ignore the
-    // type of file we *aren't* running
-    if (!global.testCommandMetadata || global.testCommandMetadata.isTest) {
-      Array.prototype.push.apply(sourceReadOptions.exclude, APP_TEST_FILENAME_REGEXPS);
-    }
-    if (!global.testCommandMetadata || global.testCommandMetadata.isAppTest) {
-      Array.prototype.push.apply(sourceReadOptions.exclude, TEST_FILENAME_REGEXPS);
-    }
 
     // Read top-level source files, excluding control files that were not
     // explicitly included.
@@ -1465,13 +1111,66 @@ _.extend(PackageSource.prototype, {
       controlFiles.push('package.js');
     }
 
-    const anyLevelExcludes = [
-      /^tests\/$/,
-      archinfo.matches(arch, "os")
-        ? /^client\/$/
-        : /^server\/$/,
+    const anyLevelExcludes = [];
+
+    if (testModule) {
+      // If we have a meteor.testModule from package.json, then we don't
+      // need to exclude tests/ directories or *.tests.js files from the
+      // search, because we trust meteor.testModule to identify a single
+      // test entry point.
+    } else {
+      anyLevelExcludes.push(/^tests\/$/);
+
+      const {
+        isTest = false,
+        isAppTest = false,
+      } = global.testCommandMetadata || {};
+
+      if (isTest || isAppTest) {
+        // If we're running `meteor test` without the --full-app option,
+        // ignore app-test-only files like *.app-tests.js.
+        if (! isAppTest) {
+          sourceReadOptions.exclude.push(
+            ...APP_TEST_FILENAME_REGEXPS,
+          );
+        }
+
+        // If we're running `meteor test` with the --full-app option,
+        // ignore non-app-test files like *.tests.js. The wisdom of this
+        // behavior is debatable, since you might want to run non-app
+        // tests even when you're using the --full-app option, but it's
+        // legacy behavior at this point, and it doesn't matter if you're
+        // using meteor.testModule anyway (recommended).
+        if (! isTest) {
+          sourceReadOptions.exclude.push(
+            ...TEST_FILENAME_REGEXPS,
+          );
+        }
+
+      } else {
+        // If we're not running `meteor test` (and meteor.testModule is
+        // not defined in package.json), ignore all test files.
+        sourceReadOptions.exclude.push(
+          ...APP_TEST_FILENAME_REGEXPS,
+          ...TEST_FILENAME_REGEXPS,
+        );
+      }
+    }
+
+    if (isApp) {
+      // In the app, server/ directories are ignored by client builds, and
+      // client/ directories are ignored by server builds. In packages,
+      // these directories should not matter (#10393).
+      anyLevelExcludes.push(
+        archinfo.matches(arch, "os")
+          ? /^client\/$/
+          : /^server\/$/
+      );
+    }
+
+    anyLevelExcludes.push(
       ...sourceReadOptions.exclude,
-    ];
+    );
 
     const topLevelExcludes = isApp ? [
       ...anyLevelExcludes,
@@ -1507,6 +1206,36 @@ _.extend(PackageSource.prototype, {
       return baseCacheKey + "\0" + dir;
     }
 
+    const dotMeteorIgnoreFiles = Object.create(null);
+
+    function removeIgnoredFilesFrom(array) {
+      Object.keys(dotMeteorIgnoreFiles).forEach(ignoreDir => {
+        const ignore = dotMeteorIgnoreFiles[ignoreDir];
+        let target = 0;
+
+        array.forEach(item => {
+          let relPath = files.pathRelative(ignoreDir, item);
+
+          if (! relPath.startsWith("..")) {
+            if (item.endsWith("/")) {
+              // The trailing slash is discarded by files.pathRelative.
+              relPath += "/";
+            }
+
+            if (ignore.ignores(relPath)) {
+              return;
+            }
+          }
+
+          array[target++] = item;
+        });
+
+        array.length = target;
+      });
+
+      return array;
+    }
+
     function find(dir, depth, inNodeModules) {
       // Remove trailing slash.
       dir = dir.replace(/\/$/, "");
@@ -1524,6 +1253,14 @@ _.extend(PackageSource.prototype, {
         return [];
       }
 
+      const absDir = files.pathJoin(self.sourceRoot, dir);
+      if (! inNodeModules) {
+        const ignore = optimisticReadMeteorIgnore(absDir);
+        if (ignore) {
+          dotMeteorIgnoreFiles[dir] = ignore;
+        }
+      }
+
       const readOptions = inNodeModules
         ? nodeModulesReadOptions
         : sourceReadOptions;
@@ -1539,6 +1276,9 @@ _.extend(PackageSource.prototype, {
           ? anyLevelExcludes
           : topLevelExcludes
       });
+
+      removeIgnoredFilesFrom(sources);
+      removeIgnoredFilesFrom(subdirectories);
 
       let nodeModulesDir;
 
@@ -1573,6 +1313,8 @@ _.extend(PackageSource.prototype, {
         sources.push(...find(nodeModulesDir, depth + 1, true));
       }
 
+      delete dotMeteorIgnoreFiles[dir];
+
       if (cacheKey) {
         self._findSourcesCache[cacheKey] = sources;
       }
@@ -1581,7 +1323,7 @@ _.extend(PackageSource.prototype, {
     }
 
     return files.withCache(() => find("", 0, false));
-  },
+  }),
 
   _findAssets({
     sourceProcessorSet,
@@ -1606,7 +1348,7 @@ _.extend(PackageSource.prototype, {
       }
 
       while (!_.isEmpty(assetDirs)) {
-        dir = assetDirs.shift();
+        var dir = assetDirs.shift();
         // remove trailing slash
         dir = dir.substr(0, dir.length - 1);
 
@@ -1627,9 +1369,10 @@ _.extend(PackageSource.prototype, {
             // Recurse on this directory.
             assetDirs.push(item);
           } else {
-            // This file is an asset.
+            // This file is an asset. Make sure filenames are Unicode
+            // normalized.
             assets.push({
-              relPath: item
+              relPath: item.normalize('NFC')
             });
           }
         });

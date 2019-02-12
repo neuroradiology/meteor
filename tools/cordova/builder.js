@@ -1,12 +1,14 @@
 import _ from 'underscore';
 import util from 'util';
+import path from 'path';
 import { Console } from '../console/console.js';
 import buildmessage from '../utils/buildmessage.js';
 import files from '../fs/files.js';
+import { optimisticReadJsonOrNull } from "../fs/optimistic.js";
 import bundler from '../isobuild/bundler.js';
 import archinfo from '../utils/archinfo.js';
 import release from '../packaging/release.js';
-import { load as loadIsopacket } from '../tool-env/isopackets.js';
+import { loadIsopackage } from '../tool-env/isopackets.js';
 import utils from '../utils/utils.js';
 
 import { CORDOVA_ARCH } from './index.js';
@@ -14,16 +16,28 @@ import { CORDOVA_ARCH } from './index.js';
 // Hard-coded size constants
 
 const iconsIosSizes = {
+  'app_store': '1024x1024',
   'iphone_2x': '120x120',
   'iphone_3x': '180x180',
-  'ipad': '76x76',
   'ipad_2x': '152x152',
   'ipad_pro': '167x167',
-  'ios_settings': '29x29',
   'ios_settings_2x': '58x58',
   'ios_settings_3x': '87x87',
+  'ios_spotlight_2x': '80x80',
+  'ios_spotlight_3x': '120x120',
+  'ios_notification_2x': '40x40',
+  'ios_notification_3x': '60x60',
+  // Legacy
+  'ipad': '76x76',
+  'ios_settings': '29x29',
   'ios_spotlight': '40x40',
-  'ios_spotlight_2x': '80x80'
+  'ios_notification': '20x20',
+  'iphone_legacy': '57x57',
+  'iphone_legacy_2x': '114x114',
+  'ipad_spotlight_legacy': '50x50',
+  'ipad_spotlight_legacy_2x': '100x100',
+  'ipad_app_legacy': '72x72',
+  'ipad_app_legacy_2x': '144x144'
 };
 
 const iconsAndroidSizes = {
@@ -35,26 +49,32 @@ const iconsAndroidSizes = {
 };
 
 const launchIosSizes = {
-  'iphone_2x': '640x960',
   'iphone5': '640x1136',
   'iphone6': '750x1334',
   'iphone6p_portrait': '1242x2208',
   'iphone6p_landscape': '2208x1242',
-  'ipad_portrait': '768x1024',
+  'iphoneX_portrait': '1125x2436',
+  'iphoneX_landscape': '2436x1125',
   'ipad_portrait_2x': '1536x2048',
-  'ipad_landscape': '1024x768',
-  'ipad_landscape_2x': '2048x1536'
+  'ipad_landscape_2x': '2048x1536',
+  // Legacy
+  'iphone': '320x480',
+  'iphone_2x': '640x960',
+  'ipad_portrait': '768x1024',
+  'ipad_landscape': '1024x768'
 };
 
 const launchAndroidSizes = {
-  'android_mdpi_portrait': '320x470',
-  'android_mdpi_landscape': '470x320',
-  'android_hdpi_portrait': '480x640',
-  'android_hdpi_landscape': '640x480',
-  'android_xhdpi_portrait': '720x960',
-  'android_xhdpi_landscape': '960x720',
-  'android_xxhdpi_portrait': '1080x1440',
-  'android_xxhdpi_landscape': '1440x1080'
+  'android_mdpi_portrait': '320x480',
+  'android_mdpi_landscape': '480x320',
+  'android_hdpi_portrait': '480x800',
+  'android_hdpi_landscape': '800x480',
+  'android_xhdpi_portrait': '720x1280',
+  'android_xhdpi_landscape': '1280x720',
+  'android_xxhdpi_portrait': '960x1600',
+  'android_xxhdpi_landscape': '1600x960',
+  'android_xxxhdpi_portrait': '1280x1920',
+  'android_xxxhdpi_landscape': '1920x1280'
 };
 
 export class CordovaBuilder {
@@ -106,6 +126,9 @@ export class CordovaBuilder {
 
     // Custom elements that will be appended into config.xml's widgets
     this.custom = [];
+
+    // Resource files that will be appended to platform bundle and config.xml
+    this.resourceFiles = [];
 
     const packageMap = this.projectContext.packageMap;
 
@@ -219,7 +242,7 @@ export class CordovaBuilder {
   }
 
   writeConfigXmlAndCopyResources(shouldCopyResources = true) {
-    const { XmlBuilder } = loadIsopacket('cordova-support')['xmlbuilder'];
+    const { XmlBuilder } = loadIsopackage('xmlbuilder');
 
     let config = XmlBuilder.create('widget');
 
@@ -302,6 +325,12 @@ export class CordovaBuilder {
       this.configureAndCopyImages(launchAndroidSizes, platformElement.android, 'splash');
     }
 
+    this.configureAndCopyResourceFiles(
+      this.resourceFiles,
+      platformElement.ios,
+      platformElement.android
+    );
+
     Console.debug('Writing new config.xml');
 
     const configXmlPath = files.pathJoin(this.projectRoot, 'config.xml');
@@ -357,6 +386,31 @@ export class CordovaBuilder {
     });
   }
 
+  configureAndCopyResourceFiles(resourceFiles, iosElement, androidElement) {
+    _.each(resourceFiles, resourceFile => {
+      // Copy file in cordova project root directory
+      var filename = path.parse(resourceFile.src).base;
+      files.copyFile(
+        files.pathResolve(this.projectContext.projectDir, resourceFile.src),
+        files.pathJoin(this.projectRoot, filename));
+      // And entry in config.xml
+      if (!resourceFile.platform ||
+          (resourceFile.platform && resourceFile.platform === "android")) {
+        androidElement.element('resource-file', {
+          src: resourceFile.src,
+          target: resourceFile.target
+        });
+      }
+      if (!resourceFile.platform ||
+          (resourceFile.platform && resourceFile.platform === "ios")) {
+        iosElement.element('resource-file', {
+          src: resourceFile.src,
+          target: resourceFile.target
+        });
+      }
+    });
+  }
+
   copyWWW(bundlePath) {
     const wwwPath = files.pathJoin(this.projectRoot, 'www');
 
@@ -388,7 +442,10 @@ export class CordovaBuilder {
     // Write program.json
     files.writeFile(programJsonPath, JSON.stringify(program), 'utf8');
 
-    const bootstrapPage = this.generateBootstrapPage(applicationPath, program, publicSettings);
+    const bootstrapPage = this.generateBootstrapPage(
+      applicationPath, program, publicSettings
+    ).await();
+
     files.writeFile(files.pathJoin(applicationPath, 'index.html'),
       bootstrapPage, 'utf8');
   }
@@ -397,10 +454,20 @@ export class CordovaBuilder {
     let configDummy = {};
     configDummy.PUBLIC_SETTINGS = publicSettings || {};
 
-    const { WebAppHashing } =
-      loadIsopacket('cordova-support')['webapp-hashing'];
-    program.version =
-      WebAppHashing.calculateClientHash(program.manifest, null, configDummy);
+    const { WebAppHashing } = loadIsopackage('webapp-hashing');
+    const { AUTOUPDATE_VERSION } = process.env;
+
+    program.version = AUTOUPDATE_VERSION ||
+      WebAppHashing.calculateClientHash(
+        program.manifest, null, configDummy);
+
+    program.versionRefreshable = AUTOUPDATE_VERSION ||
+      WebAppHashing.calculateClientHash(
+        program.manifest, type => type === "css", configDummy);
+
+    program.versionNonRefreshable = AUTOUPDATE_VERSION ||
+      WebAppHashing.calculateClientHash(
+        program.manifest, type => type !== "css", configDummy);
   }
 
   generateBootstrapPage(applicationPath, program, publicSettings) {
@@ -408,7 +475,6 @@ export class CordovaBuilder {
       release.current.isCheckout() ? "none" : release.current.name;
 
     const manifest = program.manifest;
-    const autoupdateVersion = process.env.AUTOUPDATE_VERSION || program.version;
 
     const mobileServerUrl = this.options.mobileServerUrl;
 
@@ -418,7 +484,15 @@ export class CordovaBuilder {
       // XXX propagate it from this.options?
       ROOT_URL_PATH_PREFIX: '',
       DDP_DEFAULT_CONNECTION_URL: mobileServerUrl,
-      autoupdateVersionCordova: autoupdateVersion,
+      autoupdate: {
+        versions: {
+          "web.cordova": {
+            version: program.version,
+            versionRefreshable: program.versionRefreshable,
+            versionNonRefreshable: program.versionNonRefreshable
+          }
+        }
+      },
       appId: this.projectContext.appIdentifier,
       meteorEnv: {
         NODE_ENV: process.env.NODE_ENV || "production",
@@ -430,8 +504,8 @@ export class CordovaBuilder {
       runtimeConfig.PUBLIC_SETTINGS = publicSettings;
     }
 
-    const { Boilerplate } =
-      loadIsopacket('cordova-support')['boilerplate-generator'];
+    const { Boilerplate } = loadIsopackage('boilerplate-generator');
+
     const boilerplate = new Boilerplate(CORDOVA_ARCH, manifest, {
       urlMapper: _.identity,
       pathMapper: (path) => files.convertToOSPath(
@@ -442,7 +516,7 @@ export class CordovaBuilder {
       }
     });
 
-    return boilerplate.toHTML();
+    return boilerplate.toHTMLAsync();
   }
 
   copyBuildOverride() {
@@ -458,6 +532,15 @@ export class CordovaBuilder {
 }
 
 function createAppConfiguration(builder) {
+  const { settingsFile } = builder.options;
+  let settings = null;
+  if (settingsFile) {
+    settings = optimisticReadJsonOrNull(settingsFile);
+    if (! settings) {
+      throw new Error("Unreadable --settings file: " + settingsFile);
+    }
+  }
+
   /**
    * @namespace App
    * @global
@@ -505,6 +588,15 @@ Valid platforms are: ios, android.`);
     },
 
     /**
+     * @summary Like `Meteor.settings`, contains data read from a JSON
+     *          file provided via the `--settings` command-line option at
+     *          build time, or null if no settings were provided.
+     * @memberOf App
+     * @type {Object}
+     */
+    settings,
+
+    /**
      * @summary Set the build-time configuration for a Cordova plugin.
      * @param {String} id The identifier of the plugin you want to
      * configure.
@@ -523,16 +615,27 @@ Valid platforms are: ios, android.`);
      * relative to the project root directory.
      *
      * Valid key values:
-     * - `iphone_2x` (120x120)
-     * - `iphone_3x` (180x180)
-     * - `ipad` (76x76)
-     * - `ipad_2x` (152x152)
-     * - `ipad_pro` (167x167)
-     * - `ios_settings` (29x29)
-     * - `ios_settings_2x` (58x58)
-     * - `ios_settings_3x` (87x87)
-     * - `ios_spotlight` (40x40)
-     * - `ios_spotlight_2x` (80x80)
+     * - `app_store` (1024x1024) // Apple App Store
+     * - `iphone_2x` (120x120) // iPhone 5, SE, 6, 6s, 7, 8
+     * - `iphone_3x` (180x180) // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus, X
+     * - `ipad_2x` (152x152) // iPad, iPad mini
+     * - `ipad_pro` (167x167) // iPad Pro
+     * - `ios_settings_2x` (58x58) // iPhone 5, SE, 6, 6s, 7, 8, iPad, mini, Pro
+     * - `ios_settings_3x` (87x87) // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus, X
+     * - `ios_spotlight_2x` (80x80) // iPhone 5, SE, 6, 6s, 7, 8, iPad, mini, Pro
+     * - `ios_spotlight_3x` (120x120) // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus, X
+     * - `ios_notification_2x` (40x40) // iPhone 5, SE, 6, 6s, 7, 8, iPad, mini, Pro
+     * - `ios_notification_3x` (60x60 // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus, X
+     * - `ipad` (76x76) // Legacy
+     * - `ios_settings` (29x29) // Legacy
+     * - `ios_spotlight` (40x40) // Legacy
+     * - `ios_notification` (20x20) // Legacy
+     * - `iphone_legacy` (57x57) // Legacy
+     * - `iphone_legacy_2x` (114x114) // Legacy
+     * - `ipad_spotlight_legacy` (50x50) // Legacy
+     * - `ipad_spotlight_legacy_2x` (100x100) // Legacy
+     * - `ipad_app_legacy` (72x72) // Legacy
+     * - `ipad_app_legacy_2x` (144x144) // Legacy
      * - `android_mdpi` (48x48)
      * - `android_hdpi` (72x72)
      * - `android_xhdpi` (96x96)
@@ -563,23 +666,28 @@ configuration. The key may be deprecated.`);
      * stretched. See the [Android docs](https://developer.android.com/guide/topics/graphics/2d-graphics.html#nine-patch).
      *
      * Valid key values:
-     * - `iphone_2x` (640x960)
-     * - `iphone5` (640x1136)
-     * - `iphone6` (750x1334)
-     * - `iphone6p_portrait` (1242x2208)
-     * - `iphone6p_landscape` (2208x1242)
-     * - `ipad_portrait` (768x1024)
-     * - `ipad_portrait_2x` (1536x2048)
-     * - `ipad_landscape` (1024x768)
-     * - `ipad_landscape_2x` (2048x1536)
-     * - `android_mdpi_portrait` (320x470)
-     * - `android_mdpi_landscape` (470x320)
-     * - `android_hdpi_portrait` (480x640)
-     * - `android_hdpi_landscape` (640x480)
-     * - `android_xhdpi_portrait` (720x960)
-     * - `android_xhdpi_landscape` (960x720)
-     * - `android_xxhdpi_portrait` (1080x1440)
-     * - `android_xxhdpi_landscape` (1440x1080)
+     * - `iphone5` (640x1136) // iPhone 5, SE
+     * - `iphone6` (750x1334) // iPhone 6, 6s, 7, 8
+     * - `iphone6p_portrait` (1242x2208) // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus
+     * - `iphone6p_landscape` (2208x1242) // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus
+     * - `iphoneX_portrait` (1125x2436) // iPhone X
+     * - `iphoneX_landscape` (2436x1125) // iPhone X
+     * - `ipad_portrait_2x` (1536x2048) // iPad, iPad mini
+     * - `ipad_landscape_2x` (2048x1536) // iPad, iPad mini
+     * - `iphone` (320x480) // Legacy
+     * - `iphone_2x` (640x960) // Legacy
+     * - `ipad_portrait` (768x1024) // Legacy
+     * - `ipad_landscape` (1024x768) // Legacy
+     * - `android_mdpi_portrait` (320x480)
+     * - `android_mdpi_landscape` (480x320)
+     * - `android_hdpi_portrait` (480x800)
+     * - `android_hdpi_landscape` (800x480)
+     * - `android_xhdpi_portrait` (720x1280)
+     * - `android_xhdpi_landscape` (1280x720)
+     * - `android_xxhdpi_portrait` (960x1600)
+     * - `android_xxhdpi_landscape` (1600x960)
+     * - `android_xxxhdpi_portrait` (1280x1920)
+     * - `android_xxxhdpi_landscape` (1920x1280)
      *
      * @memberOf App
      */
@@ -643,11 +751,27 @@ configuration. The key may be deprecated.`);
      *
      * `App.appendToConfig('<any-xml-content/>');`
      *
-     * @param  {String} element The XML you want to include 
+     * @param  {String} element The XML you want to include
      * @memberOf App
      */
     appendToConfig: function (xml) {
       builder.custom.push(xml);
     },
+
+    /**
+     * @summary Add a resource file for your build as described in the
+     * [Cordova documentation](http://cordova.apache.org/docs/en/7.x/config_ref/index.html#resource-file).
+     * @param {String} src The project resource path.
+     * @param {String} target Resource destination in build.
+     * @param {String} [platform] Optional. A platform name (either `ios` or `android`, both if ommited) to add a resource-file entry.
+     * @memberOf App
+     */
+    addResourceFile: function (src, target, platform) {
+      builder.resourceFiles.push({
+        src: src,
+        target: target,
+        platform: platform
+      });
+    }
   };
 }

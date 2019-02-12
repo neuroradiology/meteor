@@ -1,12 +1,12 @@
 Package.describe({
   summary: "Meteor's latency-compensated distributed data server",
-  version: '1.3.10',
+  version: '2.2.0',
   documentation: null
 });
 
 Npm.depends({
-  "permessage-deflate": "0.1.5",
-  sockjs: "0.3.17"
+  "permessage-deflate": "0.1.6",
+  sockjs: "0.3.19"
 });
 
 Package.onUse(function (api) {
@@ -31,7 +31,7 @@ Package.onUse(function (api) {
   api.use('autopublish', 'server', {weak: true});
 
   // If the facts package is loaded, publish some statistics.
-  api.use('facts', 'server', {weak: true});
+  api.use('facts-base', 'server', {weak: true});
 
   api.use('callback-hook', 'server');
 

@@ -2,9 +2,9 @@ var assert = require("assert");
 var fs = require("fs");
 var path = require("path");
 var net = require("net");
-var eachline = require("eachline");
 var chalk = require("chalk");
 var EOL = require("os").EOL;
+import { isEmacs } from "./utils/utils.js";
 
 // These two values (EXITING_MESSAGE and getInfoFile) must match the
 // values used by the shell-server package.
@@ -137,7 +137,8 @@ Cp.setUpSocket = function setUpSocket(sock, key) {
     // Sending a JSON-stringified options object (even just an empty
     // object) over the socket is required to start the REPL session.
     sock.write(JSON.stringify({
-      terminal: ! process.env.EMACS,
+      columns: process.stdout.columns,
+      terminal: ! isEmacs(),
       key: key
     }) + "\n");
 
@@ -180,7 +181,7 @@ Cp.setUpSocket = function setUpSocket(sock, key) {
 
   sock.pipe(process.stdout);
 
-  eachline(sock, "utf8", function(line) {
+  require("./utils/eachline.js").eachline(sock, function (line) {
     self.exitOnClose = line.indexOf(EXITING_MESSAGE) >= 0;
   });
 
@@ -195,7 +196,7 @@ function shellBanner() {
     "Welcome to the server-side interactive shell!"
   ];
 
-  if (! process.env.EMACS) {
+  if (! isEmacs()) {
     // Tab completion sadly does not work in Emacs.
     bannerLines.push(
       "",

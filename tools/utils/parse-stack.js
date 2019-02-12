@@ -15,8 +15,13 @@ const _ = require('underscore');
 // return anything past that function. We call this the "user portion"
 // of the stack.
 export function parse(err) {
+  const stack = err.stack;
+  if (typeof stack !== "string") {
+    return {};
+  }
+
   // at least the first line is the exception
-  const frames = err.stack.split("\n").slice(1)
+  const frames = stack.split("\n").slice(1)
     // longjohn adds lines of the form '---' (45 times) to separate
     // the trace across async boundaries. It's not clear if we need to
     // separate the trace in the same way we do for future boundaries below
@@ -58,10 +63,10 @@ export function parse(err) {
 // will not be returned, but you'd also say that those frames are "at
 // the bottom of the stack". Frames below the bottom are the outer
 // context of the framework running the user's code.
-export function markBottom(f) {
+export function markBottom(f, context) {
   /* eslint-disable camelcase */
   return function __bottom_mark__() {
-    return f.apply(this, arguments);
+    return f.apply(context || this, arguments);
   };
   /* eslint-enable camelcase */
 }
@@ -83,9 +88,9 @@ export function markTop(f) {
 function parseStackFrames(frames) {
   let stop = false;
   let ret = [];
-  frames.forEach((frame) => {
+  frames.some(frame => {
     if (stop) {
-      return;
+      return true;
     }
 
     let m;
@@ -109,8 +114,7 @@ function parseStackFrames(frames) {
         return;
       }
       if (m[1].match(/(?:^|\.)__bottom_mark__$/)) {
-        stop = true;
-        return;
+        return stop = true;
       }
       ret.push({
         func: m[1],
@@ -134,8 +138,13 @@ function parseStackFrames(frames) {
 
     if (m = frame.match(/^\s*-\s*-\s*-\s*-\s*-\s*$/)) {
       // Stop parsing if we reach a stack split from a Future
-      stop = true;
-      return;
+      return stop = true;
+    }
+
+    if (frame.startsWith(" => awaited here:")) {
+      // The meteor-promise library inserts " => awaited here:" lines to
+      // indicate async boundaries.
+      return stop = true;
     }
 
     if (_.isEmpty(ret)) {

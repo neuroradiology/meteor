@@ -42,7 +42,7 @@ var Profile = require('./profile.js').Profile;
 // process if any of their sources have changed.
 //
 // Example usage:
-//   var DDP = require('./isopackets.js').load('ddp')['ddp-client'].DDP;
+//   var DDP = require('./isopackets.js').loadIsopackage('ddp-client').DDP;
 //   var reverse = DDP.connect('reverse.meteor.com');
 //   Console.info(reverse.call('reverse', 'hello world'));
 
@@ -50,13 +50,28 @@ var Profile = require('./profile.js').Profile;
 // All of the defined isopackets. Whenever they are being built, they will be
 // built in the order listed here.
 export const ISOPACKETS = {
-  'ddp': ['ddp-client'],
-  'mongo': ['npm-mongo'],
-  'ejson': ['ejson'],
-  'constraint-solver': ['constraint-solver'],
-  'cordova-support': ['boilerplate-generator', 'logging', 'webapp-hashing',
-                      'xmlbuilder'],
-  'logging': ['logging']
+  // These packages used to be divided up into distinct isopackets, but
+  // that resulted in extremely wasteful duplication of transitive
+  // dependencies, so now we have only one isopacket that combines all the
+  // dependencies of every former isopacket.
+  combined: [
+    // ddp
+    'ddp-client',
+    // mongo
+    'npm-mongo',
+    // ejson
+    'ejson',
+    // constraint-solver
+    'constraint-solver',
+    // cordova-support
+    'boilerplate-generator',
+    'webapp-hashing',
+    'xmlbuilder',
+    // cordova-support, logging
+    'logging',
+    // support for childProcess.sendMessage(topic, payload)
+    'inter-process-messaging',
+  ]
 };
 
 // Caches isopackets in memory (each isopacket only needs to be loaded
@@ -75,17 +90,19 @@ export const ISOPACKETS = {
 // the tool itself.
 var loadedIsopackets = {};
 
-// The main entry point: loads and returns an isopacket from cache or from
-// disk. Does not do a build step: ensureIsopacketsLoadable must be called
-// first!
-export function load(isopacketName) {
+// The main entry point: loads the specified isopacket ("combined" by
+// default) from cache or from disk, and returns the requested package
+// dependency, complaining if the package does not exist. Note that
+// ensureIsopacketsLoadable must be called first, as this function does
+// not trigger any building.
+export function loadIsopackage(packageName, isopacketName = "combined") {
   // Small but necessary hack: because archinfo.host() calls execFileSync,
   // it yields the first time we call it, which is a problem for the
   // fiberHelpers.noYieldsAllowed block below. Calling it here ensures the
   // result is cached, so no yielding occurs later.
   assert.strictEqual(archinfo.host().split(".", 1)[0], "os");
 
-  return fiberHelpers.noYieldsAllowed(function () {
+  const isopacket = fiberHelpers.noYieldsAllowed(function () {
     if (_.has(loadedIsopackets, isopacketName)) {
       if (loadedIsopackets[isopacketName]) {
         return loadedIsopackets[isopacketName];
@@ -93,9 +110,8 @@ export function load(isopacketName) {
 
       // This is the case where the isopacket is up to date on disk but not
       // loaded.
-      var isopacket = loadIsopacketFromDisk(isopacketName);
-      loadedIsopackets[isopacketName] = isopacket;
-      return isopacket;
+      return loadedIsopackets[isopacketName] =
+        loadIsopacketFromDisk(isopacketName);
     }
 
     if (_.has(ISOPACKETS, isopacketName)) {
@@ -105,6 +121,12 @@ export function load(isopacketName) {
 
     throw Error("Unknown isopacket: " + isopacketName);
   });
+
+  if (! _.has(isopacket, packageName)) {
+    throw new Error("Unknown isopacket dependency: " + packageName);
+  }
+
+  return isopacket[packageName];
 }
 
 var isopacketPath = function (isopacketName) {
@@ -221,6 +243,9 @@ var newIsopacketBuildingCatalog = function () {
   var messages = buildmessage.capture(
     { title: "scanning local core packages" },
     function () {
+      const packagesDir =
+        files.pathJoin(files.getCurrentToolsDir(), 'packages');
+
       // When running from a checkout, isopacket building does use local
       // packages, but *ONLY THOSE FROM THE CHECKOUT*: not app packages or
       // $PACKAGE_DIRS packages.  One side effect of this: we really really
@@ -228,9 +253,8 @@ var newIsopacketBuildingCatalog = function () {
       // (there's no worries about needing to springboard).
       isopacketCatalog.initialize({
         localPackageSearchDirs: [
-          files.pathJoin(files.getCurrentToolsDir(), 'packages'),
-          files.pathJoin(files.getCurrentToolsDir(),
-            'packages-for-isopackets', 'blaze', 'packages')
+          packagesDir,
+          files.pathJoin(packagesDir, "non-core", "*", "packages"),
         ],
         buildingIsopackets: true
       });
@@ -307,6 +331,3 @@ var loadIsopacketFromDisk = function (isopacketName) {
 
   return ret;
 };
-
-// Support `import isopackets from "../path/to/isopackets.js"`.
-export default exports;

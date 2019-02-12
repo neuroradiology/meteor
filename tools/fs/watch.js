@@ -1,9 +1,18 @@
 import files from './files.js';
 import _ from "underscore";
-import pathwatcher from './safe-pathwatcher.js';
+import * as safeWatcher from './safe-watcher.js';
 import {createHash} from "crypto";
 import {coalesce} from '../utils/func-utils.js';
 import {Profile} from '../tool-env/profile.js';
+
+import {
+  optimisticStatOrNull,
+  optimisticReaddir,
+  optimisticHashOrNull,
+} from "./optimistic.js";
+
+const WATCH_COALESCE_MS =
+  process.env.METEOR_FILE_WATCH_COALESCE_MS || 100;
 
 // Watch for changes to a set of files, and the first time that any of
 // the files change, call a user-provided callback. (If you want a
@@ -238,7 +247,7 @@ export class WatchSet {
   }
 }
 
-var readFile = function (absPath) {
+export function readFile(absPath) {
   try {
     return files.readFile(absPath);
   } catch (e) {
@@ -251,13 +260,17 @@ var readFile = function (absPath) {
   }
 };
 
-export function sha1(contents) {
-  return Profile("sha1", function () {
-    var hash = createHash('sha1');
-    hash.update(contents);
-    return hash.digest('hex');
-  })();
-}
+export const sha1 = Profile("sha1", function (...args) {
+  var hash = createHash('sha1');
+  args.forEach(arg => hash.update(arg));
+  return hash.digest('hex');
+});
+
+export const sha512 = Profile("sha512", function (...args) {
+  var hash = createHash('sha512');
+  args.forEach(arg => hash.update(arg));
+  return hash.digest('base64');
+});
 
 export function readDirectory({absPath, include, exclude, names}) {
   // Read the directory.
@@ -274,22 +287,19 @@ export function readDirectory({absPath, include, exclude, names}) {
   // Add slashes to the end of directories.
   var contentsWithSlashes = [];
   _.each(contents, function (entry) {
-    try {
-      // We do stat instead of lstat here, so that we treat symlinks to
-      // directories just like directories themselves.
-      // XXX Does the treatment of symlinks make sense?
-      var stats = files.stat(files.pathJoin(absPath, entry));
-    } catch (e) {
-      if (e && (e.code === 'ENOENT')) {
-        // Disappeared after the readdir (or a dangling symlink)? Eh,
-        // pretend it was never there in the first place.
-        return;
-      }
-      throw e;
+    // We do stat instead of lstat here, so that we treat symlinks to
+    // directories just like directories themselves.
+    const stat = files.statOrNull(files.pathJoin(absPath, entry));
+    if (! stat) {
+      // Disappeared after the readdir (or a dangling symlink)?
+      // Eh, pretend it was never there in the first place.
+      return;
     }
-    if (stats.isDirectory()) {
+
+    if (stat.isDirectory()) {
       entry += '/';
     }
+
     contentsWithSlashes.push(entry);
   });
 
@@ -338,8 +348,8 @@ export class Watcher {
 
     self.watches = {
       // <absolute path of watched file or directory>: {
-      //   // Null until pathwatcher.watch succeeds in watching the file.
-      //   watcher: <object returned by pathwatcher.watch> | null,
+      //   // Null until safeWatcher.watch succeeds in watching the file.
+      //   watcher: <object returned by safeWatcher.watch> | null,
       //   // Undefined until we stat the file for the first time, then null
       //   // if the file is observed to be missing.
       //   lastStat: <object returned by files.stat> | null | undefined
@@ -369,9 +379,9 @@ export class Watcher {
       throw new Error("Checking unknown file " + absPath);
     }
 
-    var contents = readFile(absPath);
+    var newHash = optimisticHashOrNull(absPath);
 
-    if (contents === null) {
+    if (newHash === null) {
       // File does not exist (or is a directory).
       // Is this what we expected?
       if (oldHash === null) {
@@ -387,8 +397,6 @@ export class Watcher {
       self._fire();
       return true;
     }
-
-    var newHash = sha1(contents);
 
     // Unchanged?
     if (newHash === oldHash) {
@@ -459,14 +467,14 @@ export class Watcher {
       return;
     }
 
-    if (files.exists(absPath)) {
+    if (files.statOrNull(absPath)) {
       if (self._mustNotExist(absPath)) {
         self._fire();
         return;
       }
 
       var onWatchEvent = self._makeWatchEventCallback(absPath);
-      entry.watcher = pathwatcher.watch(absPath, onWatchEvent);
+      entry.watcher = safeWatcher.watch(absPath, onWatchEvent);
 
       // If we successfully created the watcher, invoke the callback
       // immediately, so that we examine this file at least once.
@@ -495,11 +503,12 @@ export class Watcher {
     // --hard), or a file was deleted and then recreated by an editor like
     // Vim. Because detecting changes can be costly, and because we care
     // most about the settled state of the file system, we use the
-    // funcUtils.coalesce helper to delay calls to the callback by 100ms,
-    // canceling any additional calls if they happen within that window of
-    // time, so that a rapid succession of calls will tend to trigger only
-    // one inspection of the file system.
-    return coalesce(100, function onWatchEvent() {
+    // funcUtils.coalesce helper to delay calls to the callback by
+    // METEOR_FILE_WATCH_COALESCE_MS or 100 milliseconds, canceling any
+    // additional calls if they happen within that window of time, so that
+    // a rapid succession of calls will tend to trigger only one inspection
+    // of the file system.
+    return coalesce(WATCH_COALESCE_MS, function onWatchEvent() {
       if (self.stopped) {
         return;
       }
@@ -561,14 +570,6 @@ export class Watcher {
     });
   }
 
-  // XXX Erk! This is wrong!  A null entry in a WatchSet means "is not a file",
-  // not "does not exist"; if you look at readAndWatchFileWithHash, "a directory
-  // where a file was expected" leads to the entry being null.  Right now this
-  // leads to infinite watcher refresh loops if something that needs to be a
-  // directory ends up as a file.  This all needs to be changed so that null
-  // means "not a file" again. A simple way to reproduce is to run
-  //    $ meteor --settings /tmp
-  // See #3854.
   _mustNotExist(absPath) {
     var wsFiles = this.watchSet.files;
     if (_.has(wsFiles, absPath)) {
@@ -589,16 +590,7 @@ export class Watcher {
     var self = this;
     var entry = self.watches[absPath];
     var lastStat = entry.lastStat;
-
-    try {
-      var stat = files.stat(absPath);
-    } catch (err) {
-      stat = null;
-      if (err.code !== "ENOENT") {
-        throw err;
-      }
-    }
-
+    var stat = files.statOrNull(absPath);
     var mustNotExist = self._mustNotExist(absPath);
     var mustBeAFile = self._mustBeAFile(absPath);
 
@@ -731,16 +723,39 @@ export function readAndWatchDirectory(watchSet, options) {
 // *rely* on the hash being returned; merely that if the hash is
 // present, it is the correct hash of the contents.
 export function readAndWatchFileWithHash(watchSet, absPath) {
-  var contents = readFile(absPath);
-  var hash = null;
+  const result = {
+    contents: null,
+    hash: null,
+  };
+
+  try {
+    result.contents = files.readFile(absPath);
+  } catch (e) {
+    if (e && e.code === "EISDIR") {
+      // Avoid adding directories to the watchSet as files.
+      return result;
+    }
+
+    if (e && e.code === "ENOENT") {
+      // Continue, leaving result.{contents,hash} both null.
+    } else {
+      // Throw all other errors.
+      throw e;
+    }
+  }
+
+  if (result.contents !== null) {
+    result.hash = sha1(result.contents);
+  }
+
   // Allow null watchSet, if we want to use readFile-style error handling in a
   // context where we might not always have a WatchSet (eg, reading
   // settings.json where we watch for "meteor run" but not for "meteor deploy").
   if (watchSet) {
-    hash = contents === null ? null : sha1(contents);
-    watchSet.addFile(absPath, hash);
+    watchSet.addFile(absPath, result.hash);
   }
-  return {contents: contents, hash: hash};
+
+  return result;
 }
 
 export function readAndWatchFile(watchSet, absPath) {

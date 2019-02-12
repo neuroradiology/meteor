@@ -6,6 +6,7 @@ var Future = require('fibers/future');
 var _ = require('underscore');
 var files = require('../fs/files.js');
 var catalog = require('../packaging/catalog/catalog.js');
+var os = require('os');
 
 var DEFAULT_RELEASE_TRACK = catalog.DEFAULT_TRACK;
 
@@ -72,7 +73,7 @@ selftest.define("run", function () {
   run.waitSecs(5);
   run.match("Modified");
   run.match("prevented startup");
-  run.match("End of comment missing");
+  run.match("Unclosed comment");
   run.match("file change");
 
   // Back to working
@@ -81,7 +82,7 @@ selftest.define("run", function () {
   run.match("restarted");
 
   // Crash just once, then restart successfully
-  s.write("crash.js", `
+  s.write("crash_then_restart.js", `
 var fs = Npm.require('fs');
 var path = Npm.require('path');
 var crashmark = path.join(process.env.METEOR_TEST_TMP, 'crashed');
@@ -96,7 +97,7 @@ try {
   run.waitSecs(5);
   run.match("restarted");
   run.stop();
-  s.unlink("crash.js");
+  s.unlink("crash_then_restart.js");
 
   run = s.run('--settings', 's.json');
   run.waitSecs(5);
@@ -106,7 +107,16 @@ try {
   run.match('s.json: parse error reading settings file');
   run.match('Waiting for file change');
   s.write('s.json', '{}');
+  run.waitSecs(15);
   run.match('App running at');
+  run.stop();
+
+  // Make sure a directory passed to --settings does not cause an infinite
+  // re-build loop (issue #3854).
+  run = s.run('--settings', os.tmpdir());
+  run.match(`${os.tmpdir()}: file not found (settings file)`);
+  run.match('Waiting for file change');
+  run.forbid('Modified -- restarting');
   run.stop();
 
   // How about a bundle failure right at startup
@@ -115,7 +125,7 @@ try {
   run.tellMongo(MONGO_LISTENING);
   run.waitSecs(5);
   run.match("prevented startup");
-  run.match("End of comment missing");
+  run.match("Unclosed comment");
   run.match("file change");
   s.unlink("junk.css");
   run.waitSecs(5);
@@ -155,7 +165,7 @@ selftest.define("run --once", ["yet-unsolved-windows-failure"], function () {
   run = s.run("--once");
   run.waitSecs(5);
   run.matchErr("Build failed");
-  run.matchErr("End of comment missing");
+  run.matchErr("Unclosed comment");
   run.expectExit(254);
   s.unlink("junk.css");
 
@@ -173,13 +183,14 @@ selftest.define("run --once", ["yet-unsolved-windows-failure"], function () {
   run.forbidAll("updated");
   s.unlink('empty.js');
   s.write('.meteor/release', originalRelease);
+});
 
-  // Try it with a real Mongo. Make sure that it actually starts one.
-  s = new Sandbox;
+selftest.define("run --once with real Mongo", function () {
+  var s = new Sandbox;
   s.createApp("onceapp", "once");
   s.cd("onceapp");
   s.set("RUN_ONCE_OUTCOME", "mongo");
-  run = s.run("--once");
+  var run = s.run("--once");
   run.waitSecs(30);
   run.expectExit(86);
 });
@@ -237,6 +248,8 @@ selftest.define("update during run", ["checkout", 'custom-warehouse'], function 
   });
   var run;
 
+  s.set("METEOR_WATCH_PRIORITIZE_CHANGED", "false");
+
   s.createApp("myapp", "packageless", { release: DEFAULT_RELEASE_TRACK + '@v1' });
   s.cd("myapp");
 
@@ -247,6 +260,7 @@ selftest.define("update during run", ["checkout", 'custom-warehouse'], function 
   run.match('localhost:3000');
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   run.matchErr('to Meteor v2 from Meteor v1');
+  run.waitSecs(10);
   run.expectExit(254);
 
   // But not if the release was forced (case 1)
@@ -257,8 +271,9 @@ selftest.define("update during run", ["checkout", 'custom-warehouse'], function 
   run.match('localhost:3000');
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   s.write('empty.js', '');
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('restarted');
+  run.waitSecs(10);
   run.stop();
   run.forbidAll("updated");
 
@@ -266,12 +281,13 @@ selftest.define("update during run", ["checkout", 'custom-warehouse'], function 
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v1');
   run = s.run("--release", DEFAULT_RELEASE_TRACK + "@v1");
   run.tellMongo(MONGO_LISTENING);
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('localhost:3000');
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   s.write('empty.js', '');
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('restarted');
+  run.waitSecs(10);
   run.stop();
   run.forbidAll("updated");
 
@@ -283,12 +299,14 @@ selftest.define("update during run", ["checkout", 'custom-warehouse'], function 
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v1');
   run = s.run();
   run.tellMongo(MONGO_LISTENING);
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('localhost:3000');
+  run.waitSecs(10);
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   s.write('empty.js', '');
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('restarted');
+  run.waitSecs(10);
   run.stop();
   run.forbidAll("updated");
 });
@@ -479,4 +497,31 @@ selftest.define("run logging in order", function () {
   for (var i = 0; i < 100000; i++) {
     run.match(`line: ${i}.`);
   }
+});
+
+selftest.define("run ROOT_URL must be an URL", function () {
+  var s = new Sandbox();
+  var run;
+
+  s.set("ROOT_URL", "192.168.0.1");
+  s.createApp("myapp", "standard-app", { dontPrepareApp: true });
+  s.cd("myapp");
+
+  run = s.run();
+  run.matchErr("$ROOT_URL, if specified, must be an URL");
+  run.expectExit(1);
+});
+
+selftest.define("app starts when settings file has BOM", function () {
+  var s = new Sandbox({ fakeMongo: true });
+  var run;
+  s.createApp("myapp", "standard-app");
+  s.cd("myapp");
+  files.writeFile(
+    files.pathJoin(s.cwd, "settings.json"),
+    "\ufeff" + JSON.stringify({ foo: "bar" }),
+  );
+  run = s.run("--settings", "settings.json", "--once");
+  run.tellMongo(MONGO_LISTENING);
+  run.forbid("Build failed");
 });

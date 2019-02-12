@@ -419,8 +419,8 @@ testAsyncMulti("httpcall - params", [
     do_test("GET", "/", {foo:"bar", fruit:"apple"}, "/?foo=bar&fruit=apple", "");
     do_test("POST", "/", {foo:"bar", fruit:"apple"}, "/", "foo=bar&fruit=apple");
     do_test("POST", "/", {foo:"bar", fruit:"apple"}, "/", "foo=bar&fruit=apple");
-    do_test("GET", "/", {'foo!':"bang!"}, {}, "/?foo%21=bang%21", "");
-    do_test("POST", "/", {'foo!':"bang!"}, {}, "/", "foo%21=bang%21");
+    do_test("GET", "/", {'foo?':"bang?"}, {}, "/?foo%3F=bang%3F", "");
+    do_test("POST", "/", {'foo?':"bang?"}, {}, "/", "foo%3F=bang%3F");
     do_test("POST", "/", {foo:"bar", fruit:"apple"}, {
       content: "stuff!"}, "/?foo=bar&fruit=apple", "stuff!");
     do_test("POST", "/", {foo:"bar", greeting:"Hello World"}, {
@@ -485,16 +485,22 @@ if (Meteor.isServer) {
       // the x-suppress-error header).
       WebApp.suppressConnectErrors();
 
-      var do_test = function (path, code, match) {
-        HTTP.get(
-          url_base() + path,
-          {headers: {'x-suppress-error': 'true'}},
-          expect(function(error, result) {
-            test.equal(result.statusCode, code);
-            if (match)
-              test.matches(result.content, match);
-          }));
-      };
+      function do_test(path, code, match) {
+        const prefix = Meteor.isModern
+          ? "" // No prefix for web.browser (modern).
+          : "/__browser.legacy";
+
+        HTTP.get(url_base() + prefix + path, {
+          headers: {
+            "x-suppress-error": "true"
+          }
+        }, expect(function(error, result) {
+          test.equal(result.statusCode, code);
+          if (match) {
+            test.matches(result.content, match);
+          }
+        }));
+      }
 
       // existing static file
       do_test("/packages/local-test_http/test_static.serveme", 200, /static file serving/);
