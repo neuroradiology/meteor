@@ -4,20 +4,17 @@ import assert from 'assert';
 import chalk from 'chalk';
 import semver from 'semver';
 
-import files from '../fs/files.js';
+import files from '../fs/files';
 import utils from '../utils/utils.js';
 import { Console } from '../console/console.js';
-import { Profile } from '../tool-env/profile.js';
+import { Profile } from '../tool-env/profile';
 import buildmessage from '../utils/buildmessage.js';
 import main from '../cli/main.js';
-import httpHelpers from '../utils/http-helpers.js';
-import { execFileSync, execFileAsync } from '../utils/processes.js';
+import { execFileSync } from '../utils/processes';
 
-import './protect-string-proto.js'; // must always come before 'cordova-lib'
 import { cordova as cordova_lib, events as cordova_events, CordovaError }
   from 'cordova-lib';
 import cordova_util from 'cordova-lib/src/cordova/util.js';
-import superspawn from 'cordova-common/src/superspawn.js';
 import PluginInfoProvider from 'cordova-common/src/PluginInfo/PluginInfoProvider.js';
 
 import { CORDOVA_PLATFORMS, CORDOVA_PLATFORM_VERSIONS, displayNameForPlatform, displayNamesForPlatforms,
@@ -64,7 +61,7 @@ const pinnedPluginVersions = {
   "cordova-plugin-file-transfer": "1.6.3",
   "cordova-plugin-geolocation": "2.4.3",
   "cordova-plugin-globalization": "1.0.7",
-  "cordova-plugin-inappbrowser": "1.7.1",
+  "cordova-plugin-inappbrowser": "3.2.0",
   "cordova-plugin-legacy-whitelist": "1.1.2",
   "cordova-plugin-media": "3.0.1",
   "cordova-plugin-media-capture": "1.4.3",
@@ -86,6 +83,9 @@ export class CordovaProject {
     this.options = options;
 
     this.pluginsDir = files.pathJoin(this.projectRoot, 'plugins');
+
+    this.buildJsonPath = files.convertToOSPath(
+      files.pathJoin(this.projectRoot, 'build.json'));
 
     this.createIfNeeded();
   }
@@ -149,6 +149,7 @@ outdated platforms`);
         this.projectContext,
         templatePath,
         { mobileServerUrl: this.options.mobileServerUrl,
+          cordovaServerPort: this.options.cordovaServerPort,
           settingsFile: this.options.settingsFile }
       );
 
@@ -182,6 +183,32 @@ outdated platforms`);
           undefined, undefined, config);
       }, undefined, null);
     }
+
+    this.writeBuildJson();
+  }
+
+  writeBuildJson() {
+    if (files.exists(this.buildJsonPath)) {
+      return;
+    }
+
+    const iosCommonOptions = {
+      // See https://github.com/apache/cordova-ios/issues/407:
+      buildFlag: [
+        "-UseModernBuildSystem=0",
+        ...(Console.verbose ? [] : ["-quiet"])
+      ]
+    };
+
+    files.writeFile(
+      this.buildJsonPath,
+      JSON.stringify({
+        ios: {
+          debug: iosCommonOptions,
+          release: iosCommonOptions,
+        }
+      }, null, 2) + "\n",
+    );
   }
 
   // Preparing
@@ -198,6 +225,7 @@ outdated platforms`);
       this.projectContext,
       this.projectRoot,
       { mobileServerUrl: this.options.mobileServerUrl,
+        cordovaServerPort: this.options.cordovaServerPort,
         settingsFile: this.options.settingsFile }
     );
 
@@ -240,8 +268,10 @@ outdated platforms`);
     delete require.cache[files.pathJoin(this.projectRoot,
       'platforms/ios/cordova/lib/prepare.js')];
 
-    const commandOptions = _.extend(this.defaultOptions,
-      { platforms: [platform] });
+    const commandOptions = {
+      ...this.defaultOptions,
+      platforms: [platform],
+    };
 
     this.runCommands(`preparing Cordova project for platform \
 ${displayNameForPlatform(platform)}`, async () => {
@@ -254,8 +284,11 @@ ${displayNameForPlatform(platform)}`, async () => {
   buildForPlatform(platform, options = {}, extraPaths) {
     assert(platform);
 
-    const commandOptions = _.extend(this.defaultOptions,
-      { platforms: [platform], options: options });
+    const commandOptions = {
+      ...this.defaultOptions,
+      platforms: [platform],
+      options,
+    };
 
     this.runCommands(`building Cordova app for platform \
 ${displayNameForPlatform(platform)}`, async () => {
@@ -266,21 +299,21 @@ ${displayNameForPlatform(platform)}`, async () => {
   // Running
 
   async run(platform, isDevice, options = [], extraPaths = []) {
+    options.push('--buildConfig', this.buildJsonPath);
     options.push(isDevice ? '--device' : '--emulator');
 
     let env = this.defaultEnvWithPathsAdded(...extraPaths);
-
-    let command = files.convertToOSPath(files.pathJoin(
-      this.projectRoot, 'platforms', platform, 'cordova', 'run'));
+    const commandOptions = {
+      ...this.defaultOptions,
+      platforms: [platform],
+      device: isDevice,
+    };
 
     this.runCommands(`running Cordova app for platform \
-${displayNameForPlatform(platform)} with options ${options}`,
-    execFileAsync(command, options, {
-      env: env,
-      cwd: this.projectRoot,
-      stdio: Console.verbose ? 'inherit' : 'pipe',
-      waitForClose: false
-    }), null, null);
+${displayNameForPlatform(platform)} with options ${options}`, async () => {
+      await cordova_lib.run(commandOptions);
+    });
+
   }
 
   // Platforms
@@ -702,7 +735,7 @@ perform cordova plugins reinstall`);
     // cordova-plugin-whitelist@1.3.2 => { 'cordova-plugin-whitelist': '1.3.2' }
     // com.cordova.plugin@file://.cordova-plugins/plugin => { 'com.cordova.plugin': 'file://.cordova-plugins/plugin' }
     // @scope/plugin@1.0.0 => { 'com.cordova.plugin': 'scope/plugin' }
-    const installed = this.listInstalledPluginVersions();
+    const installed = this.listInstalledPluginVersions(true);
     const installedPluginsNames = Object.keys(installed);
     const installedPluginsVersions = Object.values(installed);
     const missingPlugins = {};
@@ -760,7 +793,11 @@ convenience, but you should adjust your dependencies.`);
   // Cordova commands support
 
   get defaultOptions() {
-    return { silent: !Console.verbose, verbose: Console.verbose };
+    return {
+      silent: !Console.verbose,
+      verbose: Console.verbose,
+      buildConfig: this.buildJsonPath,
+    };
   }
 
   defaultEnvWithPathsAdded(...extraPaths) {
