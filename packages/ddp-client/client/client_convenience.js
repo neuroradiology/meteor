@@ -1,5 +1,6 @@
 import { DDP } from '../common/namespace.js';
 import { Meteor } from 'meteor/meteor';
+import { loadAsyncStubHelpers } from "./queueStubsHelpers";
 
 // Meteor.refresh can be called on the client (if you're in common code) but it
 // only has an effect on the server.
@@ -38,6 +39,9 @@ function onDDPVersionNegotiationFailure(description) {
   }
 }
 
+// Makes sure to inject the stub async helpers before creating the connection
+loadAsyncStubHelpers();
+
 Meteor.connection = DDP.connect(ddpUrl, {
   onDDPVersionNegotiationFailure: onDDPVersionNegotiationFailure
 });
@@ -47,21 +51,14 @@ Meteor.connection = DDP.connect(ddpUrl, {
 [
   'subscribe',
   'methods',
+  'isAsyncCall',
   'call',
+  'callAsync',
   'apply',
+  'applyAsync',
   'status',
   'reconnect',
   'disconnect'
 ].forEach(name => {
   Meteor[name] = Meteor.connection[name].bind(Meteor.connection);
 });
-
-// Meteor.connection used to be called
-// Meteor.default_connection. Provide backcompat as a courtesy even
-// though it was never documented.
-// XXX COMPAT WITH 0.6.4
-Meteor.default_connection = Meteor.connection;
-
-// We should transition from Meteor.connect to DDP.connect.
-// XXX COMPAT WITH 0.6.4
-Meteor.connect = DDP.connect;

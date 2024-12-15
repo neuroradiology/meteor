@@ -14,15 +14,14 @@
 import { spawn } from 'child_process';
 import * as files from '../fs/files';
 import {
-  markTop as parseStackMarkTop,
   parse as parseStackParse,
-} from '../utils/parse-stack.js';
+} from '../utils/parse-stack';
 import { Console } from '../console/console.js';
 import Matcher from './matcher.js';
 import OutputLog from './output-log.js';
 import { randomPort, timeoutScaleFactor, sleepMs } from '../utils/utils.js';
 import TestFailure from './test-failure.js';
-import { execFileSync } from '../utils/processes';
+import { execFileAsync } from '../utils/processes';
 
 let runningTest = null;
 
@@ -124,11 +123,14 @@ export default class Run {
   }
 
   _endMatchers() {
-    this.matcherEndPromise =
-      this.matcherEndPromise || Promise.all([
-        this.stdoutMatcher.endAsync(),
-        this.stderrMatcher.endAsync()
-      ]);
+    const self = this;
+    async function endFunctions() {
+      await self.stdoutMatcher.awaitMatchPromise();
+      await self.stdoutMatcher.endAsync();
+      await self.stderrMatcher.awaitMatchPromise();
+      await self.stderrMatcher.endAsync();
+    }
+    this.matcherEndPromise = this.matcherEndPromise || endFunctions();
     return this.matcherEndPromise;
   }
 
@@ -144,6 +146,7 @@ export default class Run {
       this._args, {
         cwd: files.convertToOSPath(this.cwd),
         env,
+        ...process.platform === 'win32' && { shell: true },
       });
 
     this.proc.on('close', (code, signal) => {
@@ -187,7 +190,12 @@ export default class Run {
     let timeout = this.baseTimeout + this.extraTime;
     timeout *= timeoutScaleFactor;
     this.extraTime = 0;
+    Console.simpleDebug('match', pattern);
     return this.stdoutMatcher.match(pattern, timeout, _strict);
+  }
+
+  getMatcherFullBuffer() {
+    return this.stdoutMatcher.getFullBuffer();
   }
 
   // As expect(), but for stderr instead of stdout.
@@ -197,13 +205,14 @@ export default class Run {
     let timeout = this.baseTimeout + this.extraTime;
     timeout *= timeoutScaleFactor;
     this.extraTime = 0;
+    Console.simpleDebug('matchErr', pattern);
     return this.stderrMatcher.match(pattern, timeout, _strict);
   }
 
   // Like match(), but won't skip ahead looking for a match. It must
   // follow immediately after the last thing we matched or read.
-  read(pattern) {
-    return this.match(pattern, true);
+  read(pattern, strict = true) {
+    return this.match(pattern, strict);
   }
 
   // As read(), but for stderr instead of stdout.
@@ -222,7 +231,7 @@ export default class Run {
   //
   // Example:
   // run = s.run("--help");
-  // run.expectExit(1);  // <<-- improtant to actually run the command
+  // run.expectExit(1);  // <<-- important to actually run the command
   // run.forbidErr("unwanted string"); // <<-- important to run **after** the
   //                                   // command ran the process.
   forbid(pattern) {
@@ -245,13 +254,13 @@ export default class Run {
 
   // Expect the program to exit without anything further being
   // printed on either stdout or stderr.
-  expectEnd() {
+  async expectEnd() {
     this._ensureStarted();
 
     let timeout = this.baseTimeout + this.extraTime;
     timeout *= timeoutScaleFactor;
     this.extraTime = 0;
-    this.expectExit();
+    await this.expectExit();
 
     this.stdoutMatcher.matchEmpty();
     this.stderrMatcher.matchEmpty();
@@ -261,10 +270,10 @@ export default class Run {
   // status. Fail if the process exits with a different code, or if
   // the process does not exit after a timeout. You can also omit the
   // argument to simply wait for the program to exit.
-  expectExit(code) {
+  async expectExit(code) {
     this._ensureStarted();
 
-    this._endMatchers().await();
+    await this._endMatchers();
 
     if (this.exitStatus === undefined) {
       let timeout = this.baseTimeout + this.extraTime;
@@ -283,7 +292,7 @@ export default class Run {
       });
 
       try {
-        promise.await();
+        await promise;
       } finally {
         clearTimeout(timer);
       }
@@ -313,14 +322,14 @@ export default class Run {
   }
 
   // Kill the program and then wait for it to actually exit.
-  stop() {
+  async stop() {
     if (this.exitStatus === undefined) {
       this._ensureStarted();
       if (this.client) {
         this.client.stop();
       }
-      this._killProcess();
-      this.expectExit();
+      await this._killProcess();
+      await this.expectExit();
     }
   }
 
@@ -335,7 +344,7 @@ export default class Run {
   }
 
   // Kills the running process and it's child processes
-  _killProcess() {
+  async _killProcess() {
     if (!this.proc) {
       throw new Error("Unexpected: `this.proc` undefined when calling _killProcess");
     }
@@ -343,7 +352,7 @@ export default class Run {
     if (process.platform === "win32") {
       // looks like in Windows `this.proc.kill()` doesn't kill child
       // processes.
-      execFileSync("taskkill", ["/pid", this.proc.pid, '/f', '/t']);
+      await execFileAsync("taskkill", ["/pid", this.proc.pid, '/f', '/t']);
     } else {
       this.proc.kill();
     }
@@ -358,7 +367,7 @@ export default class Run {
   //
   // Blocks until a connection to fake-mongod can be
   // established. Throws a TestFailure if it cannot be established.
-  tellMongo(command) {
+  async tellMongo(command) {
     if (! this.fakeMongoPort) {
       throw new Error("fakeMongo option on sandbox must be set");
     }
@@ -384,10 +393,10 @@ export default class Run {
         attempts++
       ) {
         // Throttle attempts to one every 100ms
-        sleepMs((lastStartTime + 100) - (+ new Date()));
+        await sleepMs((lastStartTime + 100) - (+ new Date()));
         lastStartTime = +(new Date());
 
-        new Promise((resolve) => {
+        await new Promise((resolve) => {
           // This is all arranged so that if a previous attempt
           // belatedly succeeds, somehow, we ignore it.
           const conn = net.connect(this.fakeMongoPort, () => {
@@ -406,7 +415,7 @@ export default class Run {
           }
           conn.on('error', fail);
           setTimeout(fail, 100); // 100ms connection timeout
-        }).await();
+        });
       }
 
       if (!this.fakeMongoConnection) {
@@ -423,7 +432,7 @@ export default class Run {
     }
   }
 
-  static runTest(testList, test, testRunner, options = {}) {
+  static async runTest(testList, test, testRunner, options = {}) {
     options.retries = options.retries || 0;
 
     let failure = null;
@@ -432,32 +441,25 @@ export default class Run {
       runningTest = test;
       startTime = +(new Date);
       // ensure we mark the bottom of the stack each time we start a new test
-      testRunner();
+      await testRunner();
     } catch (e) {
       failure = e;
     } finally {
       runningTest = null;
-      test.cleanup();
+      await test.cleanup();
     }
 
     test.durationMs = +(new Date) - startTime;
 
     if (failure) {
-      Console.error("... fail!", Console.options({ indent: 2 }));
-
-      if (options.retries > 0) {
-        Console.error(
-          "... retrying (" +
-          options.retries +
-          (options.retries === 1 ? " try" : " tries") +
-          " remaining) ...",
-          Console.options({ indent: 2 })
-        );
-
-        options.retries--;
-
-        return this.runTest(testList, test, testRunner, options);
+      let checkmark;
+      if (process.platform === "win32") {
+        checkmark = 'FAIL';
+      } else {
+        checkmark = '\u2717'; // CROSS
       }
+
+      Console.error(`... fail! (${test.durationMs} ms)`, Console.options({ bulletPoint: `${checkmark} ` }));
 
       if (failure instanceof TestFailure) {
         const frames = parseStackParse(failure).outsideFiber;
@@ -491,24 +493,24 @@ export default class Run {
         });
 
         Console.rawError(
-          `  => ${failure.reason} at ${pathWithLineNumber}\n`);
+          ` => Failure Reason: "${failure.reason}" at "${pathWithLineNumber}"\n`);
         if (failure.reason === 'no-match' || failure.reason === 'junk-before' ||
             failure.reason === 'match-timeout') {
-          Console.arrowError(`Pattern: ${failure.details.pattern}`, 2);
+          Console.arrowError(`Pattern: "${failure.details.pattern}"`, 2);
         }
         if (failure.reason === "wrong-exit-code") {
           const s = status => `${status.signal || status.code || "???"}`;
 
           Console.rawError(
-            `  => Expected: ${s(failure.details.expected)}` +
-            `; actual: ${s(failure.details.actual)}\n`);
+            `  => Expected: "${s(failure.details.expected)}"` +
+            `; actual: "${s(failure.details.actual)}"\n`);
         }
         if (failure.reason === 'expected-exception') {
         }
         if (failure.reason === 'not-equal') {
           Console.rawError(
-            "  => Expected: " + JSON.stringify(failure.details.expected) +
-              "; actual: " + JSON.stringify(failure.details.actual) + "\n");
+            `  => Expected: "${JSON.stringify(failure.details.expected)}"; 
+            actual: "${JSON.stringify(failure.details.actual)}"`);
         }
 
         if (failure.details.run) {
@@ -537,10 +539,23 @@ export default class Run {
         Console.rawError(`  => Test threw exception: ${failure.stack}\n`);
       }
 
+      if (options.retries > 0) {
+        Console.error(
+          "... retrying (" +
+          options.retries +
+          (options.retries === 1 ? " try" : " tries") +
+          " remaining) ...",
+          Console.options({ indent: 2 })
+        );
+
+        options.retries--;
+
+        return this.runTest(testList, test, testRunner, options);
+      }
+
       testList.notifyFailed(test, failure);
     } else {
-      Console.error(`... ok (${test.durationMs} ms)`,
-        Console.options({ indent: 2 }));
+      Console.success(`... ok! (${test.durationMs} ms)`);
     }
   }
 }

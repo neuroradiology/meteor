@@ -7,14 +7,14 @@ import {
 import { matches as archMatches, isLegacyArch } from "../utils/archinfo";
 import {
   pathJoin,
-  pathRelative,
   pathNormalize,
   pathDirname,
   pathBasename,
   convertToOSPath,
   convertToPosixPath,
+  containsPath,
 } from "../fs/files";
-import { Stats } from "fs";
+import { Stats, BigIntStats } from "fs";
 import { wrap } from "optimism";
 import {
   optimisticStatOrNull,
@@ -31,6 +31,7 @@ nativeNames.forEach((id: string) => {
   // identifier will not be imported at runtime, but the modules it
   // depends on are necessary for the original import to succeed.
   nativeModulesMap[id] =  "meteor-node-stubs/deps/" + id;
+  nativeModulesMap[`node:${id}`] =  "meteor-node-stubs/deps/" + id;
 });
 
 export type ResolverOptions = {
@@ -42,7 +43,7 @@ export type ResolverOptions = {
 }
 
 export type Resolution = {
-  stat: Stats;
+  stat: Stats | BigIntStats;
   path: string;
   packageJsonMap?: Record<string, Record<string, any>>;
   id?: string;
@@ -63,7 +64,7 @@ export default class Resolver {
   private nodeModulesPaths: string[];
   private mainFields: string[];
 
-  public statOrNull = optimisticStatOrNull as (path: string) => Stats | null;
+  public statOrNull = optimisticStatOrNull as (path: string) => Stats | BigIntStats | null | undefined;
 
   constructor({
     sourceRoot,
@@ -126,7 +127,7 @@ export default class Resolver {
 
   // Resolve the given module identifier to an object { path, stat } or
   // null, relative to an absolute parent path. The _seenDirPaths
-  // parameter is for internal use only and should be ommitted.
+  // parameter is for internal use only and should be omitted.
   public resolve(
     id: string,
     absParentPath: string,
@@ -300,8 +301,7 @@ export default class Resolver {
     }
 
     let sourceRoot: string | undefined;
-    const relParentPath = pathRelative(this.sourceRoot, absParentPath);
-    if (! relParentPath.startsWith("..")) {
+    if (containsPath(this.sourceRoot, absParentPath)) {
       // If the file is contained by this.sourceRoot, then it's safe to
       // use this.sourceRoot as the limiting ancestor directory in the
       // while loop below, but we're still going to check whether the file
@@ -312,7 +312,7 @@ export default class Resolver {
     }
 
     this.nodeModulesPaths.some(path => {
-      if (! pathRelative(path, absParentPath).startsWith("..")) {
+      if (containsPath(path, absParentPath)) {
         // If the file is inside an external node_modules directory,
         // consider the rootDir to be the parent directory of that
         // node_modules directory, rather than this.sourceRoot.

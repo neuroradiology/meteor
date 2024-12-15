@@ -3,7 +3,6 @@ var semver = require('semver');
 var os = require('os');
 var url = require('url');
 
-var fiberHelpers = require('./fiber-helpers.js');
 var archinfo = require('./archinfo');
 var buildmessage = require('./buildmessage.js');
 var files = require('../fs/files');
@@ -44,11 +43,15 @@ exports.parseUrl = function (str, defaults) {
   // for consistency remove colon at the end of protocol
   parsed.protocol = parsed.protocol.replace(/\:$/, '');
 
-  return {
+  var ret = {
     protocol: hasScheme ? parsed.protocol : defaultProtocol,
     hostname: parsed.hostname || defaultHostname,
     port: parsed.port || defaultPort
   };
+  if (parsed.pathname !== '/' && parsed.pathname) {
+    ret.pathname = parsed.pathname;
+  }
+  return ret;
 };
 
 // 'options' is an object with 'hostname', 'port', and 'protocol' keys, such as
@@ -73,7 +76,7 @@ exports.ipAddress = function () {
     .where({ family: "IPv4", internal: false })
     .value();
 
-  if (addressEntries.length == 0) {
+  if (! addressEntries.length) {
     throw new Error(`Could not find a network interface with a non-internal IPv4 address.`);
   }
 
@@ -123,10 +126,10 @@ exports.printPackageList = function (items, options) {
 // that make sense to users (eg, the name they manually gave their
 // computer on OS X, which might contain spaces) over names that have
 // any particular technical significance (eg, might resolve in DNS).
-exports.getHost = function (...args) {
+exports.getHost = async function (...args) {
   var ret;
-  var attempt = function (...args) {
-    var output = exports.execFileSync(args[0], args.slice(1)).stdout;
+  var attempt = async function (...args) {
+    var output = await exports.execFile(args[0], args.slice(1)).stdout;
     if (output) {
       ret = output.trim();
     }
@@ -139,7 +142,7 @@ exports.getHost = function (...args) {
     // This can contain spaces. See
     // http://osxdaily.com/2012/10/24/set-the-hostname-computer-name-and-bonjour-name-separately-in-os-x/
     if (! ret) {
-      attempt("scutil", "--get", "ComputerName");
+      await attempt("scutil", "--get", "ComputerName");
     }
   }
 
@@ -149,7 +152,7 @@ exports.getHost = function (...args) {
     // the domain name, to reduce the extent to which the output
     // varies with DNS.
     if (! ret) {
-      attempt("hostname", "-s");
+      await attempt("hostname", "-s");
     }
   }
 
@@ -157,7 +160,7 @@ exports.getHost = function (...args) {
   // Windows. Unknown platforms that have a command called "hostname"
   // that deletes all of your files deserve what the get.
   if (! ret) {
-    attempt("hostname");
+    await attempt("hostname");
   }
 
   // Otherwise, see what Node can come up with.
@@ -168,10 +171,10 @@ exports.getHost = function (...args) {
 // Meteor Accounts, mostly so that when the user is seeing a list of
 // their open sessions in their profile on the web, they have a way to
 // decide which ones they want to revoke.
-exports.getAgentInfo = function () {
+exports.getAgentInfo = async function () {
   var ret = {};
 
-  var host = utils.getHost();
+  var host = await utils.getHost();
   if (host) {
     ret.host = host;
   }
@@ -191,15 +194,15 @@ exports.sleepMs = function (ms) {
     return;
   }
 
-  new Promise(function (resolve) {
+  return new Promise(function (resolve) {
     setTimeout(resolve, ms);
-  }).await();
+  });
 };
 
 // Return a short, high entropy string without too many funny
 // characters in it.
 exports.randomToken = function () {
-  return (Math.random() * 0x100000000 + 1).toString(36);
+  return (Math.random() * 0x100000000 + 1).toString(36).replace('.', '');
 };
 
 // Like utils.randomToken, except a legal variable name, i.e. the first
@@ -509,8 +512,38 @@ exports.isValidVersion = function (version, {forCordova}) {
     || (forCordova ? exports.isUrlWithSha(version): exports.isNpmUrl(version));
 };
 
-
 exports.execFileSync = function (file, args, opts) {
+  var child_process = require('child_process');
+
+  opts = opts || {};
+  if (!_.has(opts, 'maxBuffer')) {
+    opts.maxBuffer = 1024 * 1024 * 10;
+  }
+
+  if (!_.has(opts, 'encoding')) {
+    opts.encoding = 'utf8';
+  }
+
+  let result;
+  try {
+    result = child_process.execFileSync(file, args, opts);
+  } catch (error) {
+    return {
+      success: false,
+      stdout: error.stdout,
+      stderr: error.stderr
+    };
+  }
+
+  return {
+    stdout: result,
+    success: true,
+    stderr: ''
+  };
+}
+
+
+exports.execFile = async function (file, args, opts) {
   var child_process = require('child_process');
   var { eachline } = require('./eachline');
 
@@ -531,9 +564,9 @@ exports.execFileSync = function (file, args, opts) {
     });
 
     return {
-      success: ! new Promise(function (resolve) {
+      success: await !new Promise(function (resolve) {
         p.on('exit', resolve);
-      }).await(),
+      }),
       stdout: "",
       stderr: ""
     };
@@ -547,7 +580,7 @@ exports.execFileSync = function (file, args, opts) {
         stderr: stderr
       });
     });
-  }).await();
+  });
 };
 
 exports.execFileAsync = function (file, args, opts) {
@@ -569,29 +602,41 @@ exports.execFileAsync = function (file, args, opts) {
   eachline(p.stdout, logOutput);
   eachline(p.stderr, logOutput);
 
+  if (!opts) {
+    return new Promise(function (resolve) {
+      child_process.execFile(file, args, opts, function (err, stdout, stderr) {
+        resolve({
+          success: ! err,
+          stdout: stdout,
+          stderr: stderr
+        });
+      });
+    });
+  }
+
   return p;
 };
 
 
-exports.runGitInCheckout = function (...args) {
+exports.runGitInCheckout = async function (...args) {
   args.unshift(
     '--git-dir=' +
     files.convertToOSPath(files.pathJoin(files.getCurrentToolsDir(), '.git')));
 
-  return exports.execFileSync('git', args).stdout;
+  return (await exports.execFile('git', args)).stdout;
 };
 
 exports.Throttled = function (options) {
   var self = this;
 
-  options = _.extend({ interval: 150 }, options || {});
+  options = Object.assign({ interval: 150 }, options || {});
   self.interval = options.interval;
   var now = +(new Date);
 
   self.next = now;
 };
 
-_.extend(exports.Throttled.prototype, {
+Object.assign(exports.Throttled.prototype, {
   isAllowed: function () {
     var self = this;
     var now = +(new Date);
@@ -619,8 +664,8 @@ exports.ThrottledYield = function (options) {
   self._throttle = new exports.Throttled(options);
 };
 
-_.extend(exports.ThrottledYield.prototype, {
-  yield: function () {
+Object.assign(exports.ThrottledYield.prototype, {
+  yield: async function () {
     var self = this;
     if (self._throttle.isAllowed()) {
       // setImmediate allows signals and IO to be processed but doesn't
@@ -629,7 +674,7 @@ _.extend(exports.ThrottledYield.prototype, {
       // setTimeout 1 (which adds a minimum of 1 ms and often more in delays).
       // XXX Actually, setImmediate is so fast that we might not even need
       // to use the throttler at all?
-      new Promise(setImmediate).await();
+      await new Promise(setImmediate);
     }
   }
 });

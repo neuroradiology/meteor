@@ -24,7 +24,7 @@ can run Meteor directly from a Git checkout using these steps:
     >
     >     $ git submodule update --init --recursive
 
-0. **Run a Meteor command to install dependencies**
+2. **Run a Meteor command to install dependencies**
 
     > If you did not compile dependencies above, this will also download the binaries.
 
@@ -33,7 +33,7 @@ can run Meteor directly from a Git checkout using these steps:
     $ ./meteor --help
     ```
 
-0. **Ready to Go!**
+3. **Ready to Go!**
 
     Your local Meteor checkout is now ready to use!  You can use this `./meteor`
     anywhere you would normally call the system `meteor`.  For example,:
@@ -43,12 +43,18 @@ can run Meteor directly from a Git checkout using these steps:
     $ /path/to/meteor-checkout/meteor run
     ```
 
-    > _Tip:_ Consider making an easy-to-run alias for frequent use:
+    > _Tip 1:_ Consider making an easy-to-run alias for frequent use:
     >
     >     alias mymeteor=/path/to-meteor-checkout/meteor
     >
     > This allows the use of `mymeteor` in place of `meteor`.  To persist this
     > across shell logouts, simply add it to `~/.bashrc` or `.zshrc`.
+
+    > _Tip 2:_ When working with meteor tool, it may be helpful to use the debugger to check what's happening. You can do this using the following flag:
+    >
+    >        TOOL_NODE_FLAGS="--inspect-brk" mymeteor
+    > 
+    > Then you can use the chrome debugger inside `chrome://inspect`.
 
 ### Notes when running from a checkout
 
@@ -65,6 +71,7 @@ When `meteor` is run from a checkout, a `dev_bundle` is automatically downloaded
 * Node.js version
 * npm version
 * MongoDB version
+* TypeScript version
 * Packages [used by `meteor-tool`](scripts/dev-bundle-tool-package.js)
 * Packages [used by the server bundle](scripts/dev-bundle-server-package.js)
 
@@ -94,7 +101,7 @@ This will generate a new tarball (`dev_bundle_<Platform>_<arch>_<version>.tar.gz
 
 ### Submitting "Dev Bundle" Pull Requests
 
-It's important to note that while `dev_bundle` pull requests are accepted/reviewed, a new `dev_bundle` can only be published to Meteor Software's Meteor infrastructure by an Meteor Software staff member. This means that the build tool and package tests of submitted `dev_bundle` pull requests will always initially fail (since the new `dev_bundle` hasn't yet been built/published by Meteor Software, which means it can't be downloaded by Meteor's continuous integration environment).
+It's important to note that while `dev_bundle` pull requests are accepted/reviewed, a new `dev_bundle` can only be published to Meteor Software's Meteor infrastructure by a Meteor Software staff member. This means that the build tool and package tests of submitted `dev_bundle` pull requests will always initially fail (since the new `dev_bundle` hasn't yet been built/published by Meteor Software, which means it can't be downloaded by Meteor's continuous integration environment).
 
 Pull requests that contain `dev_bundle` changes will be noted by repo collaborators, and a request to have a new `dev_bundle` built/published will be forwarded to Meteor Software.
 
@@ -125,6 +132,14 @@ full test-suite (including the tests you added) to ensure you haven't broken any
 
 Exactly in the same way that [`test-packages` works in standalone Meteor apps](https://guide.meteor.com/writing-atmosphere-packages.html#testing), the `test-packages` command will start up a Meteor app with [TinyTest](./packages/tinytest/README.md).  To view the results, just connect to `http://localhost:3000`.
 
+If you want to see results in the console you can use:
+
+    PUPPETEER_DOWNLOAD_PATH=~/.npm/chromium ./packages/test-in-console/run.sh
+
+> [PUPPETEER_DOWNLOAD_PATH](https://github.com/dfernandez79/puppeteer/blob/main/README.md#q-chromium-gets-downloaded-on-every-npm-ci-run-how-can-i-cache-the-download) is optional but this is useful to skip Downloading Chromium on every run
+
+> We run our tests on Travis like above.
+
 #### Running specific tests
 
 Specific package tests can be run by passing a `<package name>` or `<package path>` to the `test-packages` command. For example, to run `mongo` tests, it's possible to run:
@@ -135,6 +150,7 @@ For more fine-grained control, if you're interested in running only the specific
 
     TINYTEST_FILTER="collection - call new Mongo.Collection" ./meteor test-packages
 
+You can also provide the same filters for `./packages/test-in-console/run.sh` explained above.
 
 ### Running Meteor Tool self-tests
 
@@ -162,6 +178,13 @@ In a similar way to the method of specifying which tests TO run, there is a way 
 
 Simply remove the `--list` flag to actually run the matching tests.
 
+#### Avoiding retries
+
+On CI we want to retry the tests to avoid false failures but in development can take some time if you retry every time a test is failing. So to avoid retries use:
+
+    ./meteor self-test --retries 0
+
+
 #### More reading
 
 For even more details on how to run Meteor Tool "self tests", please refer to the [Testing section of the Meteor Tool README](https://github.com/meteor/meteor/blob/master/tools/README.md#testing).
@@ -182,7 +205,7 @@ Since Meteor is a free, open-source project, you can run tests in the context of
 
 To enable CircleCI for your development:
 
-1. Make sure you have an account with [CircleCI](https://circleci.com)
+0. Make sure you have an account with [CircleCI](https://circleci.com)
 0. Make sure you have [forked](https://help.github.com/articles/fork-a-repo/) [Meteor](https://github.com/meteor/meteor) into your own GitHub account.
 0. Go to the [Add Projects](https://circleci.com/add-projects) page on CircleCI.
 0. On the left, click on your GitHub username.
@@ -201,7 +224,7 @@ To enable CircleCI for your development:
 
 ## Commit messages
 
-Good commit messages are very important and you should make sure to explain what is changing and why.  The commit message should include:
+Good commit messages are very important and you should make sure to explain what is changing and why. The commit message should include:
 
 * A short and helpful commit title (maximum 80 characters).
 * A commit description which clearly explains the change if it's not super-obvious by the title.  Some description always helps!

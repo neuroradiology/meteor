@@ -1,8 +1,8 @@
 var Anser = require("anser");
-var _ = require('underscore');
 var runLog = require('./run-log.js');
 
-// options: listenPort, proxyToPort, proxyToHost, onFailure
+// options: listenPort, proxyToPort, proxyToHost,
+// onFailure, ignoredUrls
 var Proxy = function (options) {
   var self = this;
 
@@ -12,6 +12,7 @@ var Proxy = function (options) {
   self.proxyToPort = options.proxyToPort;
   self.proxyToHost = options.proxyToHost || '127.0.0.1';
   self.onFailure = options.onFailure || function () {};
+  self.ignoredUrls = options.ignoredUrls || [];
 
   self.mode = "hold";
   self.httpQueue = []; // keys: req, res
@@ -21,11 +22,11 @@ var Proxy = function (options) {
   self.server = null;
 };
 
-_.extend(Proxy.prototype, {
+Object.assign(Proxy.prototype, {
   // Start the proxy server, block (yield) until it is ready to go
   // (actively listening on outer and proxying to inner), and then
   // return.
-  start: function () {
+  start: async function () {
     var self = this;
 
     if (self.server) {
@@ -47,11 +48,19 @@ _.extend(Proxy.prototype, {
 
     var server = self.server = http.createServer(function (req, res) {
       // Normal HTTP request
+      if (self.ignoredUrls.includes(req.url)) {
+        return;
+      }
+
       self.httpQueue.push({ req: req, res: res });
       self._tryHandleConnections();
     });
 
     self.server.on('upgrade', function (req, socket, head) {
+      if (self.ignoredUrls.includes(req.url)) {
+        return;
+      }
+
       // Websocket connection
       self.websocketQueue.push({ req: req, socket: socket, head: head });
       self._tryHandleConnections();
@@ -62,7 +71,7 @@ _.extend(Proxy.prototype, {
       allowStart = resolve;
     });
 
-    self.server.on('error', function (err) {
+    self.server.on('error', async function (err) {
       if (err.code === 'EADDRINUSE') {
         var port = self.listenPort;
         runLog.log(
@@ -83,7 +92,7 @@ _.extend(Proxy.prototype, {
       } else {
         runLog.log('' + err);
       }
-      self.onFailure();
+      await self.onFailure();
       allowStart();
     });
 
@@ -133,7 +142,7 @@ _.extend(Proxy.prototype, {
       allowStart();
     });
 
-    promise.await();
+    await promise;
   },
 
   // Idempotent.
@@ -163,13 +172,13 @@ _.extend(Proxy.prototype, {
     self.proxy = null;
 
     // Drop any held connections.
-    _.each(self.httpQueue, function (c) {
+    self.httpQueue?.forEach(function (c) {
       c.res.statusCode = 500;
       c.res.end();
     });
     self.httpQueue = [];
 
-    _.each(self.websocketQueue, function (c) {
+    self.websocketQueue?.forEach(function (c) {
       c.socket.destroy();
     });
     self.websocketQueue = [];
@@ -260,7 +269,7 @@ function showErrorPage(res) {
 
     <pre>`);
 
-      _.each(runLog.getLog(), function (item) {
+  runLog.getLog().forEach(function (item) {
         res.write(Anser.ansiToHtml(Anser.escapeForHtml(item.message)) + "\n");
       });
 

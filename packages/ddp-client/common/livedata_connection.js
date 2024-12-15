@@ -3,7 +3,6 @@ import { DDPCommon } from 'meteor/ddp-common';
 import { Tracker } from 'meteor/tracker';
 import { EJSON } from 'meteor/ejson';
 import { Random } from 'meteor/random';
-import { Hook } from 'meteor/callback-hook';
 import { MongoID } from 'meteor/mongo-id';
 import { DDP } from './namespace.js';
 import MethodInvoker from './MethodInvoker.js';
@@ -14,13 +13,6 @@ import {
   isEmpty,
   last,
 } from "meteor/ddp-common/utils.js";
-
-let Fiber;
-let Future;
-if (Meteor.isServer) {
-  Fiber = Npm.require('fibers');
-  Future = Npm.require('fibers/future');
-}
 
 class MongoIDMap extends IdMap {
   constructor() {
@@ -84,7 +76,8 @@ export class Connection {
     if (typeof url === 'object') {
       self._stream = url;
     } else {
-      const { ClientStream } = require("meteor/socket-stream-client");
+      import { ClientStream } from "meteor/socket-stream-client";
+
       self._stream = new ClientStream(url, {
         retry: options.retry,
         ConnectionError: DDP.ConnectionError,
@@ -160,7 +153,7 @@ export class Connection {
     // documents written by a given method's stub. keys are associated with
     // methods whose stub wrote at least one document, and whose data-done message
     // has not yet been received.
-    self._documentsWrittenByStub = Object.create(null);
+    self._documentsWrittenByStub = {};
     // collection -> IdMap of "server document" object. A "server document" has:
     // - "document": the version of the document according the
     //   server (ie, the snapshot before a stub wrote it, amended by any changes
@@ -168,7 +161,7 @@ export class Connection {
     //   It is undefined if we think the document does not exist
     // - "writtenByStubs": a set of method IDs whose stubs wrote to the document
     //   whose "data done" messages have not yet been processed
-    self._serverDocuments = Object.create(null);
+    self._serverDocuments = {};
 
     // Array of callbacks to be called after the next update of the local
     // cache. Used for:
@@ -197,16 +190,16 @@ export class Connection {
     // Map from method ID -> true. Methods are removed from this when their
     // "data done" message is received, and we will not quiesce until it is
     // empty.
-    self._methodsBlockingQuiescence = Object.create(null);
+    self._methodsBlockingQuiescence = {};
     // map from sub ID -> true for subs that were ready (ie, called the sub
     // ready callback) before reconnect but haven't become ready again yet
-    self._subsBeingRevived = Object.create(null); // map from sub._id -> true
+    self._subsBeingRevived = {}; // map from sub._id -> true
     // if true, the next data update should reset all stores. (set during
     // reconnect.)
     self._resetStores = false;
 
     // name -> array of updates for (yet to be created) collections
-    self._updatesForUnknownStores = Object.create(null);
+    self._updatesForUnknownStores = {};
     // if we're blocking a migration, the retry func
     self._retryMigrate = null;
 
@@ -216,7 +209,7 @@ export class Connection {
       self
     );
     // Collection name -> array of messages.
-    self._bufferedWrites = Object.create(null);
+    self._bufferedWrites = {};
     // When current buffer of updates must be flushed at, in ms timestamp.
     self._bufferedWritesFlushAt = null;
     // Timeout handle for the next processing of all pending writes
@@ -236,7 +229,7 @@ export class Connection {
     //                    an error, XXX COMPAT WITH 1.0.3.1)
     //   - stopCallback (an optional callback to call when the sub terminates
     //     for any reason, with an error argument if an error triggered the stop)
-    self._subscriptions = Object.create(null);
+    self._subscriptions = {};
 
     // Reactive userId.
     self._userId = null;
@@ -244,8 +237,8 @@ export class Connection {
 
     // Block auto-reload while we're waiting for method responses.
     if (Meteor.isClient &&
-        Package.reload &&
-        ! options.reloadWithOutstanding) {
+      Package.reload &&
+      ! options.reloadWithOutstanding) {
       Package.reload.Reload._onMigrate(retry => {
         if (! self._readyToMigrate()) {
           self._retryMigrate = retry;
@@ -289,7 +282,7 @@ export class Connection {
   // 'name' is the name of the data on the wire that should go in the
   // store. 'wrappedStore' should be an object with methods beginUpdate, update,
   // endUpdate, saveOriginals, retrieveOriginals. see Collection for an example.
-  registerStore(name, wrappedStore) {
+  createStoreMethods(name, wrappedStore) {
     const self = this;
 
     if (name in self._stores) return false;
@@ -314,6 +307,13 @@ export class Connection {
       };
     });
     self._stores[name] = store;
+    return store;
+  }
+
+  registerStoreClient(name, wrappedStore) {
+    const self = this;
+
+    const store = self.createStoreMethods(name, wrappedStore);
 
     const queued = self._updatesForUnknownStores[name];
     if (Array.isArray(queued)) {
@@ -322,6 +322,23 @@ export class Connection {
         store.update(msg);
       });
       store.endUpdate();
+      delete self._updatesForUnknownStores[name];
+    }
+
+    return true;
+  }
+  async registerStoreServer(name, wrappedStore) {
+    const self = this;
+
+    const store = self.createStoreMethods(name, wrappedStore);
+
+    const queued = self._updatesForUnknownStores[name];
+    if (Array.isArray(queued)) {
+      await store.beginUpdate(queued.length, false);
+      for (const msg of queued) {
+        await store.update(msg);
+      }
+      await store.endUpdate();
       delete self._updatesForUnknownStores[name];
     }
 
@@ -399,7 +416,7 @@ export class Connection {
         // onReady callback provided, if any.)
         // If the sub is already ready, run the ready callback right away.
         // It seems that users would expect an onReady callback inside an
-        // autorun to trigger once the the sub first becomes ready and also
+        // autorun to trigger once the sub first becomes ready and also
         // when re-subs happens.
         if (existing.ready) {
           callbacks.onReady();
@@ -439,7 +456,7 @@ export class Connection {
           this.ready && this.readyDeps.changed();
         },
         stop() {
-          this.connection._send({ msg: 'unsub', id: id });
+          this.connection._sendQueued({ msg: 'unsub', id: id });
           this.remove();
 
           if (callbacks.onStop) {
@@ -494,30 +511,17 @@ export class Connection {
     return handle;
   }
 
-  // options:
-  // - onLateError {Function(error)} called if an error was received after the ready event.
-  //     (errors received before ready cause an error to be thrown)
-  _subscribeAndWait(name, args, options) {
-    const self = this;
-    const f = new Future();
-    let ready = false;
-    args = args || [];
-    args.push({
-      onReady() {
-        ready = true;
-        f['return']();
-      },
-      onError(e) {
-        if (!ready) f['throw'](e);
-        else options && options.onLateError && options.onLateError(e);
-      }
-    });
-
-    const handle = self.subscribe.apply(self, [name].concat(args));
-    f.wait();
-    return handle;
+  /**
+   * @summary Tells if the method call came from a call or a callAsync.
+   * @alias Meteor.isAsyncCall
+   * @locus Anywhere
+   * @memberOf Meteor
+   * @importFromPackage meteor
+   * @returns boolean
+   */
+  isAsyncCall(){
+    return DDP._CurrentMethodInvocation._isCallAsyncMethodRunning()
   }
-
   methods(methods) {
     Object.entries(methods).forEach(([name, func]) => {
       if (typeof func !== 'function') {
@@ -530,11 +534,18 @@ export class Connection {
     });
   }
 
+  _getIsSimulation({isFromCallAsync, alreadyInSimulation}) {
+    if (!isFromCallAsync) {
+      return alreadyInSimulation;
+    }
+    return alreadyInSimulation && DDP._CurrentMethodInvocation._isCallAsyncMethodRunning();
+  }
+
   /**
    * @memberOf Meteor
    * @importFromPackage meteor
    * @alias Meteor.call
-   * @summary Invokes a method passing any number of arguments.
+   * @summary Invokes a method with a sync stub, passing any number of arguments.
    * @locus Anywhere
    * @param {String} name Name of method to invoke
    * @param {EJSONable} [arg1,arg2...] Optional method arguments
@@ -549,6 +560,26 @@ export class Connection {
       callback = args.pop();
     }
     return this.apply(name, args, callback);
+  }
+  /**
+   * @memberOf Meteor
+   * @importFromPackage meteor
+   * @alias Meteor.callAsync
+   * @summary Invokes a method with an async stub, passing any number of arguments.
+   * @locus Anywhere
+   * @param {String} name Name of method to invoke
+   * @param {EJSONable} [arg1,arg2...] Optional method arguments
+   * @returns {Promise}
+   */
+  callAsync(name /* .. [arguments] .. */) {
+    const args = slice.call(arguments, 1);
+    if (args.length && typeof args[args.length - 1] === 'function') {
+      throw new Error(
+        "Meteor.callAsync() does not accept a callback. You should 'await' the result, or use .then()."
+      );
+    }
+
+    return this.applyAsync(name, args, { returnServerResultPromise: true });
   }
 
   /**
@@ -568,6 +599,115 @@ export class Connection {
    * @param {Function} [asyncCallback] Optional callback; same semantics as in [`Meteor.call`](#meteor_call).
    */
   apply(name, args, options, callback) {
+    const { stubInvocation, invocation, ...stubOptions } = this._stubCall(name, EJSON.clone(args));
+
+    if (stubOptions.hasStub) {
+      if (
+        !this._getIsSimulation({
+          alreadyInSimulation: stubOptions.alreadyInSimulation,
+          isFromCallAsync: stubOptions.isFromCallAsync,
+        })
+      ) {
+        this._saveOriginals();
+      }
+      try {
+        stubOptions.stubReturnValue = DDP._CurrentMethodInvocation
+          .withValue(invocation, stubInvocation);
+        if (Meteor._isPromise(stubOptions.stubReturnValue)) {
+          Meteor._debug(
+            `Method ${name}: Calling a method that has an async method stub with call/apply can lead to unexpected behaviors. Use callAsync/applyAsync instead.`
+          );
+        }
+      } catch (e) {
+        stubOptions.exception = e;
+      }
+    }
+    return this._apply(name, stubOptions, args, options, callback);
+  }
+
+  /**
+   * @memberOf Meteor
+   * @importFromPackage meteor
+   * @alias Meteor.applyAsync
+   * @summary Invoke a method passing an array of arguments.
+   * @locus Anywhere
+   * @param {String} name Name of method to invoke
+   * @param {EJSONable[]} args Method arguments
+   * @param {Object} [options]
+   * @param {Boolean} options.wait (Client only) If true, don't send this method until all previous method calls have completed, and don't send any subsequent method calls until this one is completed.
+   * @param {Function} options.onResultReceived (Client only) This callback is invoked with the error or result of the method (just like `asyncCallback`) as soon as the error or result is available. The local cache may not yet reflect the writes performed by the method.
+   * @param {Boolean} options.noRetry (Client only) if true, don't send this method again on reload, simply call the callback an error with the error code 'invocation-failed'.
+   * @param {Boolean} options.throwStubExceptions (Client only) If true, exceptions thrown by method stubs will be thrown instead of logged, and the method will not be invoked on the server.
+   * @param {Boolean} options.returnStubValue (Client only) If true then in cases where we would have otherwise discarded the stub's return value and returned undefined, instead we go ahead and return it. Specifically, this is any time other than when (a) we are already inside a stub or (b) we are in Node and no callback was provided. Currently we require this flag to be explicitly passed to reduce the likelihood that stub return values will be confused with server return values; we may improve this in future.
+   * @param {Boolean} options.returnServerResultPromise (Client only) If true, the promise returned by applyAsync will resolve to the server's return value, rather than the stub's return value. This is useful when you want to ensure that the server's return value is used, even if the stub returns a promise. The same behavior as `callAsync`.
+   */
+  applyAsync(name, args, options, callback = null) {
+    const stubPromise = this._applyAsyncStubInvocation(name, args, options);
+
+    const promise = this._applyAsync({
+      name,
+      args,
+      options,
+      callback,
+      stubPromise,
+    });
+    if (Meteor.isClient) {
+      // only return the stubReturnValue
+      promise.stubPromise = stubPromise.then(o => {
+        if (o.exception) {
+          throw o.exception;
+        }
+        return o.stubReturnValue;
+      });
+      // this avoids attribute recursion
+      promise.serverPromise = new Promise((resolve, reject) =>
+        promise.then(resolve).catch(reject),
+      );
+    }
+    return promise;
+  }
+  async _applyAsyncStubInvocation(name, args, options) {
+    const { stubInvocation, invocation, ...stubOptions } = this._stubCall(name, EJSON.clone(args), options);
+    if (stubOptions.hasStub) {
+      if (
+        !this._getIsSimulation({
+          alreadyInSimulation: stubOptions.alreadyInSimulation,
+          isFromCallAsync: stubOptions.isFromCallAsync,
+        })
+      ) {
+        this._saveOriginals();
+      }
+      try {
+        /*
+         * The code below follows the same logic as the function withValues().
+         *
+         * But as the Meteor package is not compiled by ecmascript, it is unable to use newer syntax in the browser,
+         * such as, the async/await.
+         *
+         * So, to keep supporting old browsers, like IE 11, we're creating the logic one level above.
+         */
+        const currentContext = DDP._CurrentMethodInvocation._setNewContextAndGetCurrent(
+          invocation
+        );
+        try {
+          stubOptions.stubReturnValue = await stubInvocation();
+        } catch (e) {
+          stubOptions.exception = e;
+        } finally {
+          DDP._CurrentMethodInvocation._set(currentContext);
+        }
+      } catch (e) {
+        stubOptions.exception = e;
+      }
+    }
+    return stubOptions;
+  }
+  async _applyAsync({ name, args, options, callback, stubPromise }) {
+    const stubOptions = await stubPromise;
+    return this._apply(name, stubOptions, args, options, callback);
+  }
+
+  _apply(name, stubCallValue, args, options, callback) {
     const self = this;
 
     // We were passed 3 arguments. They may be either (name, args, options)
@@ -587,102 +727,42 @@ export class Connection {
         "delivering result of invoking '" + name + "'"
       );
     }
+    const {
+      hasStub,
+      exception,
+      stubReturnValue,
+      alreadyInSimulation,
+      randomSeed,
+    } = stubCallValue;
 
     // Keep our args safe from mutation (eg if we don't send the message for a
     // while because of a wait method).
     args = EJSON.clone(args);
-
-    const enclosing = DDP._CurrentMethodInvocation.get();
-    const alreadyInSimulation = enclosing && enclosing.isSimulation;
-
-    // Lazily generate a randomSeed, only if it is requested by the stub.
-    // The random streams only have utility if they're used on both the client
-    // and the server; if the client doesn't generate any 'random' values
-    // then we don't expect the server to generate any either.
-    // Less commonly, the server may perform different actions from the client,
-    // and may in fact generate values where the client did not, but we don't
-    // have any client-side values to match, so even here we may as well just
-    // use a random seed on the server.  In that case, we don't pass the
-    // randomSeed to save bandwidth, and we don't even generate it to save a
-    // bit of CPU and to avoid consuming entropy.
-    let randomSeed = null;
-    const randomSeedGenerator = () => {
-      if (randomSeed === null) {
-        randomSeed = DDPCommon.makeRpcSeed(enclosing, name);
-      }
-      return randomSeed;
-    };
-
-    // Run the stub, if we have one. The stub is supposed to make some
-    // temporary writes to the database to give the user a smooth experience
-    // until the actual result of executing the method comes back from the
-    // server (whereupon the temporary writes to the database will be reversed
-    // during the beginUpdate/endUpdate process.)
-    //
-    // Normally, we ignore the return value of the stub (even if it is an
-    // exception), in favor of the real return value from the server. The
-    // exception is if the *caller* is a stub. In that case, we're not going
-    // to do a RPC, so we use the return value of the stub as our return
-    // value.
-
-    let stubReturnValue;
-    let exception;
-    const stub = self._methodHandlers[name];
-    if (stub) {
-      const setUserId = userId => {
-        self.setUserId(userId);
-      };
-
-      const invocation = new DDPCommon.MethodInvocation({
-        isSimulation: true,
-        userId: self.userId(),
-        setUserId: setUserId,
-        randomSeed() {
-          return randomSeedGenerator();
-        }
-      });
-
-      if (!alreadyInSimulation) self._saveOriginals();
-
-      try {
-        // Note that unlike in the corresponding server code, we never audit
-        // that stubs check() their arguments.
-        stubReturnValue = DDP._CurrentMethodInvocation.withValue(
-          invocation,
-          () => {
-            if (Meteor.isServer) {
-              // Because saveOriginals and retrieveOriginals aren't reentrant,
-              // don't allow stubs to yield.
-              return Meteor._noYieldsAllowed(() => {
-                // re-clone, so that the stub can't affect our caller's values
-                return stub.apply(invocation, EJSON.clone(args));
-              });
-            } else {
-              return stub.apply(invocation, EJSON.clone(args));
-            }
-          }
-        );
-      } catch (e) {
-        exception = e;
-      }
-    }
-
     // If we're in a simulation, stop and return the result we have,
     // rather than going on to do an RPC. If there was no stub,
     // we'll end up returning undefined.
-    if (alreadyInSimulation) {
+    if (
+      this._getIsSimulation({
+        alreadyInSimulation,
+        isFromCallAsync: stubCallValue.isFromCallAsync,
+      })
+    ) {
+      let result;
+
       if (callback) {
         callback(exception, stubReturnValue);
-        return undefined;
+      } else {
+        if (exception) throw exception;
+        result = stubReturnValue;
       }
-      if (exception) throw exception;
-      return stubReturnValue;
+
+      return options._returnMethodInvoker ? { result } : result;
     }
 
     // We only create the methodId here because we don't actually need one if
     // we're already in a simulation
     const methodId = '' + self._nextMethodId++;
-    if (stub) {
+    if (hasStub) {
       self._retrieveAndStoreOriginals(methodId);
     }
 
@@ -692,9 +772,9 @@ export class Connection {
     // wrote.
     const message = {
       msg: 'method',
+      id: methodId,
       method: name,
-      params: args,
-      id: methodId
+      params: args
     };
 
     // If an exception occurred in a stub, and we're ignoring it
@@ -719,27 +799,34 @@ export class Connection {
     // return the value of the RPC to the caller.
 
     // If the caller didn't give a callback, decide what to do.
-    let future;
+    let promise;
     if (!callback) {
-      if (Meteor.isClient) {
-        // On the client, we don't have fibers, so we can't block. The
-        // only thing we can do is to return undefined and discard the
-        // result of the RPC. If an error occurred then print the error
-        // to the console.
-        callback = err => {
+      if (
+        Meteor.isClient &&
+        !options.returnServerResultPromise &&
+        (!options.isFromCallAsync || options.returnStubValue)
+      ) {
+        callback = (err) => {
           err && Meteor._debug("Error invoking Method '" + name + "'", err);
         };
       } else {
-        // On the server, make the function synchronous. Throw on
-        // errors, return on success.
-        future = new Future();
-        callback = future.resolver();
+        promise = new Promise((resolve, reject) => {
+          callback = (...allArgs) => {
+            let args = Array.from(allArgs);
+            let err = args.shift();
+            if (err) {
+              reject(err);
+              return;
+            }
+            resolve(...args);
+          };
+        });
       }
     }
 
     // Send the randomSeed only if we used it
-    if (randomSeed !== null) {
-      message.randomSeed = randomSeed;
+    if (randomSeed.value !== null) {
+      message.randomSeed = randomSeed.value;
     }
 
     const methodInvoker = new MethodInvoker({
@@ -752,35 +839,101 @@ export class Connection {
       noRetry: !!options.noRetry
     });
 
-    if (options.wait) {
-      // It's a wait method! Wait methods go in their own block.
-      self._outstandingMethodBlocks.push({
-        wait: true,
-        methods: [methodInvoker]
-      });
+    let result;
+
+    if (promise) {
+      result = options.returnStubValue ? promise.then(() => stubReturnValue) : promise;
     } else {
-      // Not a wait method. Start a new block if the previous block was a wait
-      // block, and add it to the last block of methods.
-      if (isEmpty(self._outstandingMethodBlocks) ||
-          last(self._outstandingMethodBlocks).wait) {
-        self._outstandingMethodBlocks.push({
-          wait: false,
-          methods: [],
-        });
+      result = options.returnStubValue ? stubReturnValue : undefined;
+    }
+
+    if (options._returnMethodInvoker) {
+      return {
+        methodInvoker,
+        result,
+      };
+    }
+
+    self._addOutstandingMethod(methodInvoker, options);
+    return result;
+  }
+
+  _stubCall(name, args, options) {
+    // Run the stub, if we have one. The stub is supposed to make some
+    // temporary writes to the database to give the user a smooth experience
+    // until the actual result of executing the method comes back from the
+    // server (whereupon the temporary writes to the database will be reversed
+    // during the beginUpdate/endUpdate process.)
+    //
+    // Normally, we ignore the return value of the stub (even if it is an
+    // exception), in favor of the real return value from the server. The
+    // exception is if the *caller* is a stub. In that case, we're not going
+    // to do a RPC, so we use the return value of the stub as our return
+    // value.
+    const self = this;
+    const enclosing = DDP._CurrentMethodInvocation.get();
+    const stub = self._methodHandlers[name];
+    const alreadyInSimulation = enclosing?.isSimulation;
+    const isFromCallAsync = enclosing?._isFromCallAsync;
+    const randomSeed = { value: null};
+
+    const defaultReturn = {
+      alreadyInSimulation,
+      randomSeed,
+      isFromCallAsync,
+    };
+    if (!stub) {
+      return { ...defaultReturn, hasStub: false };
+    }
+
+    // Lazily generate a randomSeed, only if it is requested by the stub.
+    // The random streams only have utility if they're used on both the client
+    // and the server; if the client doesn't generate any 'random' values
+    // then we don't expect the server to generate any either.
+    // Less commonly, the server may perform different actions from the client,
+    // and may in fact generate values where the client did not, but we don't
+    // have any client-side values to match, so even here we may as well just
+    // use a random seed on the server.  In that case, we don't pass the
+    // randomSeed to save bandwidth, and we don't even generate it to save a
+    // bit of CPU and to avoid consuming entropy.
+
+    const randomSeedGenerator = () => {
+      if (randomSeed.value === null) {
+        randomSeed.value = DDPCommon.makeRpcSeed(enclosing, name);
       }
+      return randomSeed.value;
+    };
 
-      last(self._outstandingMethodBlocks).methods.push(methodInvoker);
-    }
+    const setUserId = userId => {
+      self.setUserId(userId);
+    };
 
-    // If we added it to the first block, send it out now.
-    if (self._outstandingMethodBlocks.length === 1) methodInvoker.sendMessage();
+    const invocation = new DDPCommon.MethodInvocation({
+      name,
+      isSimulation: true,
+      userId: self.userId(),
+      isFromCallAsync: options?.isFromCallAsync,
+      setUserId: setUserId,
+      randomSeed() {
+        return randomSeedGenerator();
+      }
+    });
 
-    // If we're using the default callback on the server,
-    // block waiting for the result.
-    if (future) {
-      return future.wait();
-    }
-    return options.returnStubValue ? stubReturnValue : undefined;
+    // Note that unlike in the corresponding server code, we never audit
+    // that stubs check() their arguments.
+    const stubInvocation = () => {
+        if (Meteor.isServer) {
+          // Because saveOriginals and retrieveOriginals aren't reentrant,
+          // don't allow stubs to yield.
+          return Meteor._noYieldsAllowed(() => {
+            // re-clone, so that the stub can't affect our caller's values
+            return stub.apply(invocation, EJSON.clone(args));
+          });
+        } else {
+          return stub.apply(invocation, EJSON.clone(args));
+        }
+    };
+    return { ...defaultReturn, hasStub: true, stubInvocation, invocation };
   }
 
   // Before calling a method stub, prepare all stores to track changes and allow
@@ -788,7 +941,7 @@ export class Connection {
   // documents.
   _saveOriginals() {
     if (! this._waitingForQuiescence()) {
-      this._flushBufferedWrites();
+      this._flushBufferedWritesClient();
     }
 
     Object.values(this._stores).forEach((store) => {
@@ -856,6 +1009,16 @@ export class Connection {
   // Sends the DDP stringification of the given message object
   _send(obj) {
     this._stream.send(DDPCommon.stringifyDDP(obj));
+  }
+
+  // Always queues the call before sending the message
+  // Used, for example, on subscription.[id].stop() to make sure a "sub" message is always called before an "unsub" message
+  // https://github.com/meteor/meteor/issues/13212
+  //
+  // This is part of the actual fix for the rest check:
+  // https://github.com/meteor/meteor/pull/13236
+  _sendQueued(obj) {
+    this._send(obj, true);
   }
 
   // We detected via DDP-level heartbeats that we've lost the
@@ -936,7 +1099,7 @@ export class Connection {
     return Object.values(invokers).some((invoker) => !!invoker.sentMessage);
   }
 
-  _livedata_connected(msg) {
+  async _livedata_connected(msg) {
     const self = this;
 
     if (self._version !== 'pre1' && self._heartbeatInterval !== 0) {
@@ -1041,22 +1204,22 @@ export class Connection {
     // call the callbacks immediately.
     if (! self._waitingForQuiescence()) {
       if (self._resetStores) {
-        Object.values(self._stores).forEach((store) => {
-          store.beginUpdate(0, true);
-          store.endUpdate();
-        });
+        for (const store of Object.values(self._stores)) {
+          await store.beginUpdate(0, true);
+          await store.endUpdate();
+        }
         self._resetStores = false;
       }
       self._runAfterUpdateCallbacks();
     }
   }
 
-  _processOneDataMessage(msg, updates) {
+  async _processOneDataMessage(msg, updates) {
     const messageType = msg.msg;
 
     // msg is one of ['added', 'changed', 'removed', 'ready', 'updated']
     if (messageType === 'added') {
-      this._process_added(msg, updates);
+      await this._process_added(msg, updates);
     } else if (messageType === 'changed') {
       this._process_changed(msg, updates);
     } else if (messageType === 'removed') {
@@ -1072,7 +1235,7 @@ export class Connection {
     }
   }
 
-  _livedata_data(msg) {
+  async _livedata_data(msg) {
     const self = this;
 
     if (self._waitingForQuiescence()) {
@@ -1103,17 +1266,17 @@ export class Connection {
       // and apply them all at once.
 
       const bufferedMessages = self._messagesBufferedUntilQuiescence;
-      Object.values(bufferedMessages).forEach(bufferedMessage => {
-        self._processOneDataMessage(
+      for (const bufferedMessage of Object.values(bufferedMessages)) {
+        await self._processOneDataMessage(
           bufferedMessage,
           self._bufferedWrites
         );
-      });
+      }
 
       self._messagesBufferedUntilQuiescence = [];
 
     } else {
-      self._processOneDataMessage(msg, self._bufferedWrites);
+      await self._processOneDataMessage(msg, self._bufferedWrites);
     }
 
     // Immediately flush writes when:
@@ -1125,7 +1288,7 @@ export class Connection {
       msg.msg === "removed";
 
     if (self._bufferedWritesInterval === 0 || ! standardWrite) {
-      self._flushBufferedWrites();
+      await self._flushBufferedWrites();
       return;
     }
 
@@ -1133,20 +1296,27 @@ export class Connection {
       self._bufferedWritesFlushAt =
         new Date().valueOf() + self._bufferedWritesMaxAge;
     } else if (self._bufferedWritesFlushAt < new Date().valueOf()) {
-      self._flushBufferedWrites();
+      await self._flushBufferedWrites();
       return;
     }
 
     if (self._bufferedWritesFlushHandle) {
       clearTimeout(self._bufferedWritesFlushHandle);
     }
-    self._bufferedWritesFlushHandle = setTimeout(
-      self.__flushBufferedWrites,
-      self._bufferedWritesInterval
-    );
+    self._bufferedWritesFlushHandle = setTimeout(() => {
+      // __flushBufferedWrites is a promise, so with this we can wait the promise to finish
+      // before doing something
+      self._liveDataWritesPromise = self.__flushBufferedWrites();
+
+      if (Meteor._isPromise(self._liveDataWritesPromise)) {
+        self._liveDataWritesPromise.finally(
+          () => (self._liveDataWritesPromise = undefined)
+        );
+      }
+    }, self._bufferedWritesInterval);
   }
 
-  _flushBufferedWrites() {
+  _prepareBuffersToFlush() {
     const self = this;
     if (self._bufferedWritesFlushHandle) {
       clearTimeout(self._bufferedWritesFlushHandle);
@@ -1159,32 +1329,48 @@ export class Connection {
     //  will exit cleanly.
     const writes = self._bufferedWrites;
     self._bufferedWrites = Object.create(null);
-    self._performWrites(writes);
+    return writes;
   }
 
-  _performWrites(updates) {
+  async _flushBufferedWritesServer() {
+    const self = this;
+    const writes = self._prepareBuffersToFlush();
+    await self._performWritesServer(writes);
+  }
+  _flushBufferedWritesClient() {
+    const self = this;
+    const writes = self._prepareBuffersToFlush();
+    self._performWritesClient(writes);
+  }
+  _flushBufferedWrites() {
+    const self = this;
+    return Meteor.isClient
+      ? self._flushBufferedWritesClient()
+      : self._flushBufferedWritesServer();
+  }
+  async _performWritesServer(updates) {
     const self = this;
 
     if (self._resetStores || ! isEmpty(updates)) {
       // Begin a transactional update of each store.
 
-      Object.entries(self._stores).forEach(([storeName, store]) => {
-        store.beginUpdate(
+      for (const [storeName, store] of Object.entries(self._stores)) {
+        await store.beginUpdate(
           hasOwn.call(updates, storeName)
             ? updates[storeName].length
             : 0,
           self._resetStores
         );
-      });
+      }
 
       self._resetStores = false;
 
-      Object.entries(updates).forEach(([storeName, updateMessages]) => {
+      for (const [storeName, updateMessages] of Object.entries(updates)) {
         const store = self._stores[storeName];
         if (store) {
-          updateMessages.forEach(updateMessage => {
-            store.update(updateMessage);
-          });
+          for (const updateMessage of updateMessages) {
+            await store.update(updateMessage);
+          }
         } else {
           // Nobody's listening for this data. Queue it up until
           // someone wants it.
@@ -1199,12 +1385,57 @@ export class Connection {
 
           updates[storeName].push(...updateMessages);
         }
-      });
-
+      }
       // End update transaction.
-      Object.values(self._stores).forEach((store) => {
+      for (const store of Object.values(self._stores)) {
+        await store.endUpdate();
+      }
+    }
+
+    self._runAfterUpdateCallbacks();
+  }
+  _performWritesClient(updates) {
+    const self = this;
+
+    if (self._resetStores || ! isEmpty(updates)) {
+      // Begin a transactional update of each store.
+
+      for (const [storeName, store] of Object.entries(self._stores)) {
+        store.beginUpdate(
+          hasOwn.call(updates, storeName)
+            ? updates[storeName].length
+            : 0,
+          self._resetStores
+        );
+      }
+
+      self._resetStores = false;
+
+      for (const [storeName, updateMessages] of Object.entries(updates)) {
+        const store = self._stores[storeName];
+        if (store) {
+          for (const updateMessage of updateMessages) {
+            store.update(updateMessage);
+          }
+        } else {
+          // Nobody's listening for this data. Queue it up until
+          // someone wants it.
+          // XXX memory use will grow without bound if you forget to
+          // create a collection or just don't care about it... going
+          // to have to do something about that.
+          const updates = self._updatesForUnknownStores;
+
+          if (! hasOwn.call(updates, storeName)) {
+            updates[storeName] = [];
+          }
+
+          updates[storeName].push(...updateMessages);
+        }
+      }
+      // End update transaction.
+      for (const store of Object.values(self._stores)) {
         store.endUpdate();
-      });
+      }
     }
 
     self._runAfterUpdateCallbacks();
@@ -1238,7 +1469,7 @@ export class Connection {
     return serverDocsForCollection.get(id) || null;
   }
 
-  _process_added(msg, updates) {
+  async _process_added(msg, updates) {
     const self = this;
     const id = MongoID.idParse(msg.id);
     const serverDoc = self._getServerDoc(msg.collection, id);
@@ -1254,7 +1485,7 @@ export class Connection {
         // Always push an update so that document stays in the store after
         // reset. Use current version of the document for this update, so
         // that stub-written values are preserved.
-        const currentDoc = self._stores[msg.collection].getDoc(msg.id);
+        const currentDoc = await self._stores[msg.collection].getDoc(msg.id);
         if (currentDoc !== undefined) msg.fields = currentDoc;
 
         self._pushUpdate(updates, msg.collection, msg);
@@ -1415,12 +1646,12 @@ export class Connection {
     }
   }
 
-  _livedata_nosub(msg) {
+  async _livedata_nosub(msg) {
     const self = this;
 
     // First pass it through _livedata_data, which only uses it to help get
     // towards quiescence.
-    self._livedata_data(msg);
+    await self._livedata_data(msg);
 
     // Do the rest of our processing immediately, with no
     // buffering-until-quiescence.
@@ -1458,14 +1689,14 @@ export class Connection {
     }
   }
 
-  _livedata_result(msg) {
+  async _livedata_result(msg) {
     // id, result or error. error has error (code), reason, details
 
     const self = this;
 
     // Lets make sure there are no buffered writes before returning result.
     if (! isEmpty(self._bufferedWrites)) {
-      self._flushBufferedWrites();
+      await self._flushBufferedWrites();
     }
 
     // find the outstanding request
@@ -1499,6 +1730,33 @@ export class Connection {
       // msg.result may be undefined if the method didn't return a
       // value
       m.receiveResult(undefined, msg.result);
+    }
+  }
+
+  _addOutstandingMethod(methodInvoker, options) {
+    if (options?.wait) {
+      // It's a wait method! Wait methods go in their own block.
+      this._outstandingMethodBlocks.push({
+        wait: true,
+        methods: [methodInvoker]
+      });
+    } else {
+      // Not a wait method. Start a new block if the previous block was a wait
+      // block, and add it to the last block of methods.
+      if (isEmpty(this._outstandingMethodBlocks) ||
+          last(this._outstandingMethodBlocks).wait) {
+        this._outstandingMethodBlocks.push({
+          wait: false,
+          methods: [],
+        });
+      }
+
+      last(this._outstandingMethodBlocks).methods.push(methodInvoker);
+    }
+
+    // If we added it to the first block, send it out now.
+    if (this._outstandingMethodBlocks.length === 1) {
+      methodInvoker.sendMessage();
     }
   }
 
@@ -1548,17 +1806,8 @@ export class Connection {
     if (msg.offendingMessage) Meteor._debug('For: ', msg.offendingMessage);
   }
 
-  _callOnReconnectAndSendAppropriateOutstandingMethods() {
+  _sendOutstandingMethodBlocksMessages(oldOutstandingMethodBlocks) {
     const self = this;
-    const oldOutstandingMethodBlocks = self._outstandingMethodBlocks;
-    self._outstandingMethodBlocks = [];
-
-    self.onReconnect && self.onReconnect();
-    DDP._reconnectHook.each(callback => {
-      callback(self);
-      return true;
-    });
-
     if (isEmpty(oldOutstandingMethodBlocks)) return;
 
     // We have at least one block worth of old outstanding methods to try
@@ -1573,9 +1822,11 @@ export class Connection {
     // OK, there are blocks on both sides. Special case: merge the last block of
     // the reconnect methods with the first block of the original methods, if
     // neither of them are "wait" blocks.
-    if (! last(self._outstandingMethodBlocks).wait &&
-        ! oldOutstandingMethodBlocks[0].wait) {
-      oldOutstandingMethodBlocks[0].methods.forEach(m => {
+    if (
+      !last(self._outstandingMethodBlocks).wait &&
+      !oldOutstandingMethodBlocks[0].wait
+    ) {
+      oldOutstandingMethodBlocks[0].methods.forEach((m) => {
         last(self._outstandingMethodBlocks).methods.push(m);
 
         // If this "last block" is also the first block, send the message.
@@ -1589,6 +1840,20 @@ export class Connection {
 
     // Now add the rest of the original blocks on.
     self._outstandingMethodBlocks.push(...oldOutstandingMethodBlocks);
+  }
+
+  _callOnReconnectAndSendAppropriateOutstandingMethods() {
+    const self = this;
+    const oldOutstandingMethodBlocks = self._outstandingMethodBlocks;
+    self._outstandingMethodBlocks = [];
+
+    self.onReconnect && self.onReconnect();
+    DDP._reconnectHook.each((callback) => {
+      callback(self);
+      return true;
+    });
+
+    self._sendOutstandingMethodBlocksMessages(oldOutstandingMethodBlocks);
   }
 
   // We can accept a hot code push if there are no methods in flight.
@@ -1606,7 +1871,7 @@ export class Connection {
     }
   }
 
-  onMessage(raw_msg) {
+  async onMessage(raw_msg) {
     let msg;
     try {
       msg = DDPCommon.parseDDP(raw_msg);
@@ -1622,17 +1887,16 @@ export class Connection {
     }
 
     if (msg === null || !msg.msg) {
-      // XXX COMPAT WITH 0.6.6. ignore the old welcome message for back
-      // compat.  Remove this 'if' once the server stops sending welcome
-      // messages (stream_server.js).
-      if (!(msg && msg.server_id))
+      if(!msg || !msg.testMessageOnConnect) {
+        if (Object.keys(msg).length === 1 && msg.server_id) return;
         Meteor._debug('discarding invalid livedata message', msg);
+      }
       return;
     }
 
     if (msg.msg === 'connected') {
       this._version = this._versionSuggestion;
-      this._livedata_connected(msg);
+      await this._livedata_connected(msg);
       this.options.onConnected();
     } else if (msg.msg === 'failed') {
       if (this._supportedDDPVersions.indexOf(msg.version) >= 0) {
@@ -1652,11 +1916,11 @@ export class Connection {
     } else if (
       ['added', 'changed', 'removed', 'ready', 'updated'].includes(msg.msg)
     ) {
-      this._livedata_data(msg);
+      await this._livedata_data(msg);
     } else if (msg.msg === 'nosub') {
-      this._livedata_nosub(msg);
+      await this._livedata_nosub(msg);
     } else if (msg.msg === 'result') {
-      this._livedata_result(msg);
+      await this._livedata_result(msg);
     } else if (msg.msg === 'error') {
       this._livedata_error(msg);
     } else {
@@ -1742,7 +2006,7 @@ export class Connection {
     // add new subscriptions at the end. this way they take effect after
     // the handlers and we don't see flicker.
     Object.entries(this._subscriptions).forEach(([id, sub]) => {
-      this._send({
+      this._sendQueued({
         msg: 'sub',
         id: id,
         name: sub.name,

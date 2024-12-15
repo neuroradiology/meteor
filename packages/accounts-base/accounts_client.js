@@ -9,6 +9,7 @@ import {AccountsCommon} from "./accounts_common.js";
  * @param {Object} options an object with fields:
  * @param {Object} options.connection Optional DDP connection to reuse.
  * @param {String} options.ddpUrl Optional URL for creating a new DDP connection.
+ * @param {'session' | 'local'} options.clientStorage Optional Define what kind of storage you want for credentials on the client. Default is 'local' to use `localStorage`. Set to 'session' to use session storage.
  */
 export class AccountsClient extends AccountsCommon {
   constructor(options) {
@@ -26,11 +27,28 @@ export class AccountsClient extends AccountsCommon {
     this.savedHash = window.location.hash;
     this._initUrlMatching();
 
+    this.initStorageLocation();
+
     // Defined in localstorage_token.js.
     this._initLocalStorage();
 
     // This is for .registerClientLoginFunction & .callLoginFunction.
     this._loginFuncs = {};
+
+    // This tracks whether callbacks registered with
+    // Accounts.onLogin have been called
+    this._loginCallbacksCalled = false;
+  }
+
+  initStorageLocation(options) {
+    // Determine whether to use local or session storage to storage credentials and anything else.
+    this.storageLocation = (options?.clientStorage === 'session' || Meteor.settings?.public?.packages?.accounts?.clientStorage === 'session') ? window.sessionStorage : Meteor._localStorage;
+  }
+
+  config(options) {
+    super.config(options);
+
+    this.initStorageLocation(options);
   }
 
   ///
@@ -115,17 +133,21 @@ export class AccountsClient extends AccountsCommon {
    */
   logout(callback) {
     this._loggingOut.set(true);
-    this.connection.apply('logout', [], {
+
+    this.connection.applyAsync('logout', [], {
+      // TODO[FIBERS]: Look this { wait: true } later.
       wait: true
-    }, (error, result) => {
-      this._loggingOut.set(false);
-      if (error) {
-        callback && callback(error);
-      } else {
+    })
+      .then((result) => {
+        this._loggingOut.set(false);
+        this._loginCallbacksCalled = false;
         this.makeClientLoggedOut();
         callback && callback();
-      }
-    });
+      })
+      .catch((e) => {
+        this._loggingOut.set(false);
+        callback && callback(e);
+      });
   }
 
   /**
@@ -202,7 +224,7 @@ export class AccountsClient extends AccountsCommon {
   //                 logged in, or with the error on error.
   //
   callLoginMethod(options) {
-    options = { 
+    options = {
       methodName: 'login',
       methodArguments: [{}],
       _suppressLoggingIn: false,
@@ -214,27 +236,29 @@ export class AccountsClient extends AccountsCommon {
     ['validateResult', 'userCallback'].forEach(f => {
       if (!options[f])
         options[f] = () => null;
-    })
+    });
 
-    // Prepare callbacks: user provided and onLogin/onLoginFailure hooks.
     let called;
+    // Prepare callbacks: user provided and onLogin/onLoginFailure hooks.
     const loginCallbacks = ({ error, loginDetails }) => {
       if (!called) {
         called = true;
         if (!error) {
-          this._onLoginHook.each(callback => {
+          this._onLoginHook.forEach(callback => {
             callback(loginDetails);
             return true;
           });
+          this._loginCallbacksCalled = true;
         } else {
-          this._onLoginFailureHook.each(callback => {
+          this._loginCallbacksCalled = false;
+          this._onLoginFailureHook.forEach(callback => {
             callback({ error });
             return true;
           });
         }
         options.userCallback(error, loginDetails);
       }
-    }
+    };
 
     let reconnected = false;
 
@@ -338,33 +362,47 @@ export class AccountsClient extends AccountsCommon {
       // Note that we need to call this even if _suppressLoggingIn is true,
       // because it could be matching a _setLoggingIn(true) from a
       // half-completed pre-reconnect login method.
-      this._setLoggingIn(false);
       if (error || !result) {
         error = error || new Error(
           `No result from call to ${options.methodName}`
         );
         loginCallbacks({ error });
+        this._setLoggingIn(false);
         return;
       }
       try {
         options.validateResult(result);
       } catch (e) {
         loginCallbacks({ error: e });
+        this._setLoggingIn(false);
         return;
       }
 
       // Make the client logged in. (The user data should already be loaded!)
       this.makeClientLoggedIn(result.id, result.token, result.tokenExpires);
-      loginCallbacks({ loginDetails: { type: result.type } });
+
+      // use Tracker to make we sure have a user before calling the callbacks
+      Tracker.autorun(async (computation) => {
+        const user = await Tracker.withComputation(computation, () =>
+          Meteor.userAsync(),
+        );
+
+        if (user) {
+          loginCallbacks({ loginDetails: result });
+          this._setLoggingIn(false);
+          computation.stop();
+        }
+      });
+
     };
 
     if (!options._suppressLoggingIn) {
       this._setLoggingIn(true);
     }
-    this.connection.apply(
+    this.connection.applyAsync(
       options.methodName,
       options.methodArguments,
-      { wait: true, onResultReceived: onResultReceived },
+      { wait: true, onResultReceived },
       loggedInAndDataReadyCallback);
   }
 
@@ -380,7 +418,7 @@ export class AccountsClient extends AccountsCommon {
     this.connection.setUserId(null);
     this._reconnectStopper && this._reconnectStopper.stop();
   }
-  
+
   makeClientLoggedIn(userId, token, tokenExpires) {
     this._storeLoginToken(userId, token, tokenExpires);
     this.connection.setUserId(userId);
@@ -443,7 +481,7 @@ export class AccountsClient extends AccountsCommon {
   // before callbacks are registered see #10157
   _startupCallback(callback) {
     // Are we already logged in?
-    if (this.connection._userId) {
+    if (this._loginCallbacksCalled) {
       // If already logged in before handler is registered, it's safe to
       // assume type is a 'resume', so we execute the callback at the end
       // of the queue so that Meteor.startup can complete before any
@@ -490,11 +528,11 @@ export class AccountsClient extends AccountsCommon {
   };
 
   _storeLoginToken(userId, token, tokenExpires) {
-    Meteor._localStorage.setItem(this.USER_ID_KEY, userId);
-    Meteor._localStorage.setItem(this.LOGIN_TOKEN_KEY, token);
+    this.storageLocation.setItem(this.USER_ID_KEY, userId);
+    this.storageLocation.setItem(this.LOGIN_TOKEN_KEY, token);
     if (! tokenExpires)
       tokenExpires = this._tokenExpiration(new Date());
-    Meteor._localStorage.setItem(this.LOGIN_TOKEN_EXPIRES_KEY, tokenExpires);
+    this.storageLocation.setItem(this.LOGIN_TOKEN_EXPIRES_KEY, tokenExpires);
 
     // to ensure that the localstorage poller doesn't end up trying to
     // connect a second time
@@ -502,9 +540,9 @@ export class AccountsClient extends AccountsCommon {
   };
 
   _unstoreLoginToken() {
-    Meteor._localStorage.removeItem(this.USER_ID_KEY);
-    Meteor._localStorage.removeItem(this.LOGIN_TOKEN_KEY);
-    Meteor._localStorage.removeItem(this.LOGIN_TOKEN_EXPIRES_KEY);
+    this.storageLocation.removeItem(this.USER_ID_KEY);
+    this.storageLocation.removeItem(this.LOGIN_TOKEN_KEY);
+    this.storageLocation.removeItem(this.LOGIN_TOKEN_EXPIRES_KEY);
 
     // to ensure that the localstorage poller doesn't end up trying to
     // connect a second time
@@ -514,15 +552,15 @@ export class AccountsClient extends AccountsCommon {
   // This is private, but it is exported for now because it is used by a
   // test in accounts-password.
   _storedLoginToken() {
-    return Meteor._localStorage.getItem(this.LOGIN_TOKEN_KEY);
+    return this.storageLocation.getItem(this.LOGIN_TOKEN_KEY);
   };
 
   _storedLoginTokenExpires() {
-    return Meteor._localStorage.getItem(this.LOGIN_TOKEN_EXPIRES_KEY);
+    return this.storageLocation.getItem(this.LOGIN_TOKEN_EXPIRES_KEY);
   };
 
   _storedUserId() {
-    return Meteor._localStorage.getItem(this.USER_ID_KEY);
+    return this.storageLocation.getItem(this.USER_ID_KEY);
   };
 
   _unstoreLoginTokenIfExpiresSoon() {
@@ -635,14 +673,14 @@ export class AccountsClient extends AccountsCommon {
   _initUrlMatching() {
     // By default, allow the autologin process to happen.
     this._autoLoginEnabled = true;
-  
+
     // We only support one callback per URL.
     this._accountsCallbacks = {};
-  
+
     // Try to match the saved value of window.location.hash.
     this._attemptToMatchHash();
   };
-  
+
   // Separate out this functionality for testing
   _attemptToMatchHash() {
     attemptToMatchHash(this, this.savedHash, defaultSuccessHandler);
@@ -728,11 +766,11 @@ export class AccountsClient extends AccountsCommon {
     this._accountsCallbacks["enroll-account"] = callback;
   };
 
-};
+}
 
 /**
- * @summary True if a login method (such as `Meteor.loginWithPassword`, 
- * `Meteor.loginWithFacebook`, or `Accounts.createUser`) is currently in 
+ * @summary True if a login method (such as `Meteor.loginWithPassword`,
+ * `Meteor.loginWithFacebook`, or `Accounts.createUser`) is currently in
  * progress. A reactive data source.
  * @locus Client
  * @importFromPackage meteor
@@ -740,7 +778,7 @@ export class AccountsClient extends AccountsCommon {
 Meteor.loggingIn = () => Accounts.loggingIn();
 
 /**
- * @summary True if a logout method (such as `Meteor.logout`) is currently in 
+ * @summary True if a logout method (such as `Meteor.logout`) is currently in
  * progress. A reactive data source.
  * @locus Client
  * @importFromPackage meteor
@@ -766,7 +804,7 @@ Meteor.logoutOtherClients = callback => Accounts.logoutOtherClients(callback);
 /**
  * @summary Login with a Meteor access token.
  * @locus Client
- * @param {Object} [token] Local storage token for use with login across 
+ * @param {Object} [token] Local storage token for use with login across
  * multiple tabs in the same browser.
  * @param {Function} [callback] Optional callback. Called with no arguments on
  * success.
@@ -792,6 +830,11 @@ if (Package.blaze) {
    */
   Template.registerHelper('currentUser', () => Meteor.user());
 
+  // TODO: the code above needs to be changed to Meteor.userAsync() when we have
+  // a way to make it reactive using async.
+  // Template.registerHelper('currentUserAsync',
+  //  async () => await Meteor.userAsync());
+
   /**
    * @global
    * @name  loggingIn
@@ -815,7 +858,7 @@ if (Package.blaze) {
    * @summary Calls [Meteor.loggingIn()](#meteor_loggingin) or [Meteor.loggingOut()](#meteor_loggingout).
    */
   Template.registerHelper(
-    'loggingInOrOut', 
+    'loggingInOrOut',
     () => Meteor.loggingIn() || Meteor.loggingOut()
   );
 }
@@ -872,6 +915,6 @@ const attemptToMatchHash = (accounts, hash, success) => {
 
 // Export for testing
 export const AccountsTest = {
-  attemptToMatchHash: (hash, success) => 
+  attemptToMatchHash: (hash, success) =>
     attemptToMatchHash(Accounts, hash, success),
 };

@@ -8,7 +8,7 @@ import { StreamClientCommon } from "./common.js";
 // Statically importing SockJS here will prevent native WebSocket usage
 // below (in favor of SockJS), but will ensure maximum compatibility for
 // clients stuck in unusual networking environments.
-import "./sockjs-0.3.4.js";
+import SockJS from "./sockjs-1.6.1-min-.js";
 
 export class ClientStream extends StreamClientCommon {
   // @param url {String} URL to Meteor app
@@ -39,13 +39,11 @@ export class ClientStream extends StreamClientCommon {
     this.heartbeatTimer = null;
 
     // Listen to global 'online' event if we are running in a browser.
-    // (IE8 does not support addEventListener)
-    if (typeof window !== 'undefined' && window.addEventListener)
-      window.addEventListener(
-        'online',
-        this._online.bind(this),
-        false /* useCapture. make FF3.6 happy. */
-      );
+    window.addEventListener(
+      'online',
+      this._online.bind(this),
+      false /* useCapture */
+    );
 
     //// Kickoff!
     this._launchConnection();
@@ -160,13 +158,14 @@ export class ClientStream extends StreamClientCommon {
     this._cleanup(); // cleanup the old socket, if there was one.
 
     var options = {
-      protocols_whitelist: this._sockjsProtocolsWhitelist(),
+      transports: this._sockjsProtocolsWhitelist(),
       ...this.options._sockjsOptions
     };
 
     const hasSockJS = typeof SockJS === "function";
+    const disableSockJS = __meteor_runtime_config__.DISABLE_SOCKJS;
 
-    this.socket = hasSockJS
+    this.socket = hasSockJS && !disableSockJS
       // Convert raw URL to SockJS URL each time we open a connection, so
       // that we can connect to random hostnames and get around browser
       // per-host connection limits.
@@ -196,7 +195,7 @@ export class ClientStream extends StreamClientCommon {
       const { lastError } = this;
       this.lastError = error;
       if (lastError) return;
-      console.log(
+      console.error(
         'stream error',
         error,
         new Date().toDateString()

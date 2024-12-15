@@ -1,6 +1,51 @@
+import isEmpty from 'lodash.isempty';
+import isString from 'lodash.isstring';
+import isObject from 'lodash.isobject';
+
 DDPServer = {};
 
-var Fiber = Npm.require('fibers');
+
+// Publication strategies define how we handle data from published cursors at the collection level
+// This allows someone to:
+// - Choose a trade-off between client-server bandwidth and server memory usage
+// - Implement special (non-mongo) collections like volatile message queues
+const publicationStrategies = {
+  // SERVER_MERGE is the default strategy.
+  // When using this strategy, the server maintains a copy of all data a connection is subscribed to.
+  // This allows us to only send deltas over multiple publications.
+  SERVER_MERGE: {
+    useDummyDocumentView: false,
+    useCollectionView: true,
+    doAccountingForCollection: true,
+  },
+  // The NO_MERGE_NO_HISTORY strategy results in the server sending all publication data
+  // directly to the client. It does not remember what it has previously sent
+  // to it will not trigger removed messages when a subscription is stopped.
+  // This should only be chosen for special use cases like send-and-forget queues.
+  NO_MERGE_NO_HISTORY: {
+    useDummyDocumentView: false,
+    useCollectionView: false,
+    doAccountingForCollection: false,
+  },
+  // NO_MERGE is similar to NO_MERGE_NO_HISTORY but the server will remember the IDs it has
+  // sent to the client so it can remove them when a subscription is stopped.
+  // This strategy can be used when a collection is only used in a single publication.
+  NO_MERGE: {
+    useDummyDocumentView: false,
+    useCollectionView: false,
+    doAccountingForCollection: true,
+  },
+  // NO_MERGE_MULTI is similar to `NO_MERGE`, but it does track whether a document is
+  // used by multiple publications. This has some memory overhead, but it still does not do
+  // diffing so it's faster and slimmer than SERVER_MERGE.
+  NO_MERGE_MULTI: {
+    useDummyDocumentView: true,
+    useCollectionView: true,
+    doAccountingForCollection: true
+  }
+};
+
+DDPServer.publicationStrategies = publicationStrategies;
 
 // This file contains classes:
 // * Session - The server's connection to a single DDP client
@@ -9,7 +54,27 @@ var Fiber = Npm.require('fibers');
 //
 // Session and Subscription are file scope. For now, until we freeze
 // the interface, Server is package scope (in the future it should be
-// exported.)
+// exported).
+var DummyDocumentView = function () {
+  var self = this;
+  self.existsIn = new Set(); // set of subscriptionHandle
+  self.dataByKey = new Map(); // key-> [ {subscriptionHandle, value} by precedence]
+};
+
+Object.assign(DummyDocumentView.prototype, {
+  getFields: function () {
+    return {}
+  },
+
+  clearField: function (subscriptionHandle, key, changeCollector) {
+    changeCollector[key] = undefined
+  },
+
+  changeField: function (subscriptionHandle, key, value,
+                         changeCollector, isAdd) {
+    changeCollector[key] = value
+  }
+});
 
 // Represents a single document in a SessionCollectionView
 var SessionDocumentView = function () {
@@ -20,8 +85,16 @@ var SessionDocumentView = function () {
 
 DDPServer._SessionDocumentView = SessionDocumentView;
 
+DDPServer._getCurrentFence = function () {
+  let currentInvocation = this._CurrentWriteFence.get();
+  if (currentInvocation) {
+    return currentInvocation;
+  }
+  currentInvocation = DDP._CurrentMethodInvocation.get();
+  return currentInvocation ? currentInvocation.fence : undefined;
+};
 
-_.extend(SessionDocumentView.prototype, {
+Object.assign(SessionDocumentView.prototype, {
 
   getFields: function () {
     var self = this;
@@ -119,7 +192,7 @@ var SessionCollectionView = function (collectionName, sessionCallbacks) {
 DDPServer._SessionCollectionView = SessionCollectionView;
 
 
-_.extend(SessionCollectionView.prototype, {
+Object.assign(SessionCollectionView.prototype, {
 
   isEmpty: function () {
     var self = this;
@@ -129,7 +202,7 @@ _.extend(SessionCollectionView.prototype, {
   diff: function (previous) {
     var self = this;
     DiffSequence.diffMaps(previous.documents, self.documents, {
-      both: _.bind(self.diffDocument, self),
+      both: self.diffDocument.bind(self),
 
       rightOnly: function (id, nowDV) {
         self.callbacks.added(self.collectionName, id, nowDV.getFields());
@@ -165,12 +238,17 @@ _.extend(SessionCollectionView.prototype, {
     var added = false;
     if (!docView) {
       added = true;
-      docView = new SessionDocumentView();
+      if (Meteor.server.getPublicationStrategy(this.collectionName).useDummyDocumentView) {
+        docView = new DummyDocumentView();
+      } else {
+        docView = new SessionDocumentView();
+      }
+
       self.documents.set(id, docView);
     }
     docView.existsIn.add(subscriptionHandle);
     var changeCollector = {};
-    _.each(fields, function (value, key) {
+    Object.entries(fields).forEach(function ([key, value]) {
       docView.changeField(
         subscriptionHandle, key, value, changeCollector, true);
     });
@@ -186,7 +264,7 @@ _.extend(SessionCollectionView.prototype, {
     var docView = self.documents.get(id);
     if (!docView)
       throw new Error("Could not find element with id " + id + " to change");
-    _.each(changed, function (value, key) {
+      Object.entries(changed).forEach(function ([key, value]) {
       if (value === undefined)
         docView.clearField(subscriptionHandle, key, changedResult);
       else
@@ -234,12 +312,14 @@ var Session = function (server, version, socket, options) {
   self.initialized = false;
   self.socket = socket;
 
-  // set to null when the session is destroyed. multiple places below
+  // Set to null when the session is destroyed. Multiple places below
   // use this to determine if the session is alive or not.
   self.inQueue = new Meteor._DoubleEndedQueue();
 
   self.blocked = false;
   self.workerRunning = false;
+
+  self.cachedUnblock = null;
 
   // Sub objects for active subscriptions
   self._namedSubs = new Map();
@@ -258,7 +338,7 @@ var Session = function (server, version, socket, options) {
   // session. The session will take care of starting it when appropriate.
   self._dontStartNewUniversalSubs = false;
 
-  // when we are rerunning subscriptions, any ready messages
+  // When we are rerunning subscriptions, any ready messages
   // we want to buffer up for when we are done rerunning subscriptions
   self._pendingReady = [];
 
@@ -297,12 +377,10 @@ var Session = function (server, version, socket, options) {
   self.send({ msg: 'connected', session: self.id });
 
   // On initial connect, spin up all the universal publishers.
-  Fiber(function () {
-    self.startUniversalSubs();
-  }).run();
+  self.startUniversalSubs();
 
   if (version !== 'pre1' && options.heartbeatInterval !== 0) {
-    // We no longer need the low level timeout because we have heartbeating.
+    // We no longer need the low level timeout because we have heartbeats.
     socket.setWebsocketTimeout(0);
 
     self.heartbeat = new DDPCommon.Heartbeat({
@@ -322,52 +400,55 @@ var Session = function (server, version, socket, options) {
     "livedata", "sessions", 1);
 };
 
-_.extend(Session.prototype, {
-
+Object.assign(Session.prototype, {
   sendReady: function (subscriptionIds) {
     var self = this;
-    if (self._isSending)
+    if (self._isSending) {
       self.send({msg: "ready", subs: subscriptionIds});
-    else {
-      _.each(subscriptionIds, function (subscriptionId) {
+    } else {
+      subscriptionIds.forEach(function (subscriptionId) {
         self._pendingReady.push(subscriptionId);
       });
     }
   },
 
-  sendAdded: function (collectionName, id, fields) {
-    var self = this;
-    if (self._isSending)
-      self.send({msg: "added", collection: collectionName, id: id, fields: fields});
+  _canSend(collectionName) {
+    return this._isSending || !this.server.getPublicationStrategy(collectionName).useCollectionView;
   },
 
-  sendChanged: function (collectionName, id, fields) {
-    var self = this;
-    if (_.isEmpty(fields))
+
+  sendAdded(collectionName, id, fields) {
+    if (this._canSend(collectionName)) {
+      this.send({ msg: 'added', collection: collectionName, id, fields });
+    }
+  },
+
+  sendChanged(collectionName, id, fields) {
+    if (isEmpty(fields))
       return;
 
-    if (self._isSending) {
-      self.send({
+    if (this._canSend(collectionName)) {
+      this.send({
         msg: "changed",
         collection: collectionName,
-        id: id,
-        fields: fields
+        id,
+        fields
       });
     }
   },
 
-  sendRemoved: function (collectionName, id) {
-    var self = this;
-    if (self._isSending)
-      self.send({msg: "removed", collection: collectionName, id: id});
+  sendRemoved(collectionName, id) {
+    if (this._canSend(collectionName)) {
+      this.send({msg: "removed", collection: collectionName, id});
+    }
   },
 
   getSendCallbacks: function () {
     var self = this;
     return {
-      added: _.bind(self.sendAdded, self),
-      changed: _.bind(self.sendChanged, self),
-      removed: _.bind(self.sendRemoved, self)
+      added: self.sendAdded.bind(self),
+      changed: self.sendChanged.bind(self),
+      removed: self.sendRemoved.bind(self)
     };
   },
 
@@ -382,25 +463,34 @@ _.extend(Session.prototype, {
     return ret;
   },
 
-  added: function (subscriptionHandle, collectionName, id, fields) {
-    var self = this;
-    var view = self.getCollectionView(collectionName);
-    view.added(subscriptionHandle, id, fields);
-  },
-
-  removed: function (subscriptionHandle, collectionName, id) {
-    var self = this;
-    var view = self.getCollectionView(collectionName);
-    view.removed(subscriptionHandle, id);
-    if (view.isEmpty()) {
-       self.collectionViews.delete(collectionName);
+  added(subscriptionHandle, collectionName, id, fields) {
+    if (this.server.getPublicationStrategy(collectionName).useCollectionView) {
+      const view = this.getCollectionView(collectionName);
+      view.added(subscriptionHandle, id, fields);
+    } else {
+      this.sendAdded(collectionName, id, fields);
     }
   },
 
-  changed: function (subscriptionHandle, collectionName, id, fields) {
-    var self = this;
-    var view = self.getCollectionView(collectionName);
-    view.changed(subscriptionHandle, id, fields);
+  removed(subscriptionHandle, collectionName, id) {
+    if (this.server.getPublicationStrategy(collectionName).useCollectionView) {
+      const view = this.getCollectionView(collectionName);
+      view.removed(subscriptionHandle, id);
+      if (view.isEmpty()) {
+         this.collectionViews.delete(collectionName);
+      }
+    } else {
+      this.sendRemoved(collectionName, id);
+    }
+  },
+
+  changed(subscriptionHandle, collectionName, id, fields) {
+    if (this.server.getPublicationStrategy(collectionName).useCollectionView) {
+      const view = this.getCollectionView(collectionName);
+      view.changed(subscriptionHandle, id, fields);
+    } else {
+      this.sendChanged(collectionName, id, fields);
+    }
   },
 
   startUniversalSubs: function () {
@@ -408,8 +498,8 @@ _.extend(Session.prototype, {
     // Make a shallow copy of the set of universal handlers and start them. If
     // additional universal publishers start while we're running them (due to
     // yielding), they will run separately as part of Server.publish.
-    var handlers = _.clone(self.server.universal_publish_handlers);
-    _.each(handlers, function (handler) {
+    var handlers = [...self.server.universal_publish_handlers];
+    handlers.forEach(function (handler) {
       self._startSubscription(handler);
     });
   },
@@ -444,14 +534,14 @@ _.extend(Session.prototype, {
       "livedata", "sessions", -1);
 
     Meteor.defer(function () {
-      // stop callbacks can yield, so we defer this on close.
+      // Stop callbacks can yield, so we defer this on close.
       // sub._isDeactivated() detects that we set inQueue to null and
       // treats it as semi-deactivated (it will ignore incoming callbacks, etc).
       self._deactivateAllSubscriptions();
 
       // Defer calling the close callbacks, so that the caller closing
       // the session isn't waiting for all the callbacks to complete.
-      _.each(self._closeCallbacks, function (callback) {
+      self._closeCallbacks.forEach(function (callback) {
         callback();
       });
     });
@@ -460,10 +550,10 @@ _.extend(Session.prototype, {
     self.server._removeSession(self);
   },
 
-  // Send a message (doing nothing if no socket is connected right now.)
-  // It should be a JSON object (it will be stringified.)
+  // Send a message (doing nothing if no socket is connected right now).
+  // It should be a JSON object (it will be stringified).
   send: function (msg) {
-    var self = this;
+    const self = this;
     if (self.socket) {
       if (Meteor._printSentDDP)
         Meteor._debug("Sent DDP", DDPCommon.stringifyDDP(msg));
@@ -480,21 +570,21 @@ _.extend(Session.prototype, {
     self.send(msg);
   },
 
-  // Process 'msg' as an incoming message. (But as a guard against
+  // Process 'msg' as an incoming message. As a guard against
   // race conditions during reconnection, ignore the message if
-  // 'socket' is not the currently connected socket.)
+  // 'socket' is not the currently connected socket.
   //
   // We run the messages from the client one at a time, in the order
   // given by the client. The message handler is passed an idempotent
   // function 'unblock' which it may call to allow other messages to
   // begin running in parallel in another fiber (for example, a method
-  // that wants to yield.) Otherwise, it is automatically unblocked
+  // that wants to yield). Otherwise, it is automatically unblocked
   // when it returns.
   //
   // Actually, we don't have to 'totally order' the messages in this
   // way, but it's the easiest thing that's correct. (unsub needs to
   // be ordered against sub, methods need to be ordered against each
-  // other.)
+  // other).
   processMessage: function (msg_in) {
     var self = this;
     if (!self.inQueue) // we have been destroyed.
@@ -505,7 +595,7 @@ _.extend(Session.prototype, {
     // pings, preserve the "pre1" behavior of responding with a "bad
     // request" for the unknown messages.
     //
-    // Fibers are needed because heartbeat uses Meteor.setTimeout, which
+    // Fibers are needed because heartbeats use Meteor.setTimeout, which
     // needs a Fiber. We could actually use regular setTimeout and avoid
     // these new fibers, but it is easier to just make everything use
     // Meteor.setTimeout and not think too hard.
@@ -513,10 +603,8 @@ _.extend(Session.prototype, {
     // Any message counts as receiving a pong, as it demonstrates that
     // the client is still alive.
     if (self.heartbeat) {
-      Fiber(function () {
-        self.heartbeat.messageReceived();
-      }).run();
-    }
+      self.heartbeat.messageReceived();
+    };
 
     if (self.version !== 'pre1' && msg_in.msg === 'ping') {
       if (self._respondToPings)
@@ -524,7 +612,7 @@ _.extend(Session.prototype, {
       return;
     }
     if (self.version !== 'pre1' && msg_in.msg === 'pong') {
-      // Since everything is a pong, nothing to do
+      // Since everything is a pong, there is nothing to do
       return;
     }
 
@@ -535,12 +623,13 @@ _.extend(Session.prototype, {
 
     var processNext = function () {
       var msg = self.inQueue && self.inQueue.shift();
+
       if (!msg) {
         self.workerRunning = false;
         return;
       }
 
-      Fiber(function () {
+      function runHandlers() {
         var blocked = true;
 
         var unblock = function () {
@@ -555,25 +644,42 @@ _.extend(Session.prototype, {
           return true;
         });
 
-        if (_.has(self.protocol_handlers, msg.msg))
-          self.protocol_handlers[msg.msg].call(self, msg, unblock);
-        else
+        if (msg.msg in self.protocol_handlers) {
+          const result = self.protocol_handlers[msg.msg].call(
+            self,
+            msg,
+            unblock
+          );
+
+          if (Meteor._isPromise(result)) {
+            result.finally(() => unblock());
+          } else {
+            unblock();
+          }
+        } else {
           self.sendError('Bad request', msg);
-        unblock(); // in case the handler didn't already do it
-      }).run();
+          unblock(); // in case the handler didn't already do it
+        }
+      }
+
+      runHandlers();
     };
 
     processNext();
   },
 
   protocol_handlers: {
-    sub: function (msg) {
+    sub: async function (msg, unblock) {
       var self = this;
+
+      // cacheUnblock temporarly, so we can capture it later
+      // we will use unblock in current eventLoop, so this is safe
+      self.cachedUnblock = unblock;
 
       // reject malformed messages
       if (typeof (msg.id) !== "string" ||
           typeof (msg.name) !== "string" ||
-          (('params' in msg) && !(msg.params instanceof Array))) {
+          ('params' in msg && !(msg.params instanceof Array))) {
         self.sendError("Malformed subscription", msg);
         return;
       }
@@ -622,8 +728,10 @@ _.extend(Session.prototype, {
 
       var handler = self.server.publish_handlers[msg.name];
 
-      self._startSubscription(handler, msg.id, msg.params, msg.name);
+      await self._startSubscription(handler, msg.id, msg.params, msg.name);
 
+      // cleaning cached unblock
+      self.cachedUnblock = null;
     },
 
     unsub: function (msg) {
@@ -632,15 +740,15 @@ _.extend(Session.prototype, {
       self._stopSubscription(msg.id);
     },
 
-    method: function (msg, unblock) {
+    method: async function (msg, unblock) {
       var self = this;
 
-      // reject malformed messages
+      // Reject malformed messages.
       // For now, we silently ignore unknown attributes,
       // for forwards compatibility.
       if (typeof (msg.id) !== "string" ||
           typeof (msg.method) !== "string" ||
-          (('params' in msg) && !(msg.params instanceof Array)) ||
+          ('params' in msg && !(msg.params instanceof Array)) ||
           (('randomSeed' in msg) && (typeof msg.randomSeed !== "string"))) {
         self.sendError("Malformed method invocation", msg);
         return;
@@ -648,7 +756,7 @@ _.extend(Session.prototype, {
 
       var randomSeed = msg.randomSeed || null;
 
-      // set up to mark the method as satisfied once all observers
+      // Set up to mark the method as satisfied once all observers
       // (and subscriptions) have reacted to any writes that were
       // done.
       var fence = new DDPServer._WriteFence;
@@ -659,31 +767,30 @@ _.extend(Session.prototype, {
         // example, because the method waits for them) their
         // writes will be included in the fence.
         fence.retire();
-        self.send({
-          msg: 'updated', methods: [msg.id]});
+        self.send({msg: 'updated', methods: [msg.id]});
       });
 
-      // find the handler
+      // Find the handler
       var handler = self.server.method_handlers[msg.method];
       if (!handler) {
         self.send({
           msg: 'result', id: msg.id,
           error: new Meteor.Error(404, `Method '${msg.method}' not found`)});
-        fence.arm();
+        await fence.arm();
         return;
       }
 
-      var setUserId = function(userId) {
-        self._setUserId(userId);
-      };
-
       var invocation = new DDPCommon.MethodInvocation({
+        name: msg.method,
         isSimulation: false,
         userId: self.userId,
-        setUserId: setUserId,
+        setUserId(userId) {
+          return self._setUserId(userId);
+        },
         unblock: unblock,
         connection: self.connectionHandle,
-        randomSeed: randomSeed
+        randomSeed: randomSeed,
+        fence,
       });
 
       const promise = new Promise((resolve, reject) => {
@@ -724,8 +831,8 @@ _.extend(Session.prototype, {
         ));
       });
 
-      function finish() {
-        fence.arm();
+      async function finish() {
+        await fence.arm();
         unblock();
       }
 
@@ -733,15 +840,14 @@ _.extend(Session.prototype, {
         msg: "result",
         id: msg.id
       };
-
-      promise.then((result) => {
-        finish();
+      return promise.then(async result => {
+        await finish();
         if (result !== undefined) {
           payload.result = result;
         }
         self.send(payload);
-      }, (exception) => {
-        finish();
+      }, async (exception) => {
+        await finish();
         payload.error = wrapInternalException(
           exception,
           `while invoking method '${msg.method}'`
@@ -778,7 +884,7 @@ _.extend(Session.prototype, {
 
   // Sets the current user id in all appropriate contexts and reruns
   // all subscriptions
-  _setUserId: function(userId) {
+  async _setUserId(userId) {
     var self = this;
 
     if (userId !== null && typeof userId !== "string")
@@ -786,13 +892,13 @@ _.extend(Session.prototype, {
                       typeof userId);
 
     // Prevent newly-created universal subscriptions from being added to our
-    // session; they will be found below when we call startUniversalSubs.
+    // session. They will be found below when we call startUniversalSubs.
     //
     // (We don't have to worry about named subscriptions, because we only add
     // them when we process a 'sub' message. We are currently processing a
     // 'method' message, and the method did not unblock, because it is illegal
     // to call setUserId after unblock. Thus we cannot be concurrently adding a
-    // new named subscription.)
+    // new named subscription).
     self._dontStartNewUniversalSubs = true;
 
     // Prevent current subs from updating our collectionViews and call their
@@ -813,26 +919,28 @@ _.extend(Session.prototype, {
     // DDP._CurrentMethodInvocation set. But DDP._CurrentMethodInvocation is not
     // expected to be set inside a publish function, so we temporary unset it.
     // Inside a publish function DDP._CurrentPublicationInvocation is set.
-    DDP._CurrentMethodInvocation.withValue(undefined, function () {
+    await DDP._CurrentMethodInvocation.withValue(undefined, async function () {
       // Save the old named subs, and reset to having no subscriptions.
       var oldNamedSubs = self._namedSubs;
       self._namedSubs = new Map();
       self._universalSubs = [];
 
-      oldNamedSubs.forEach(function (sub, subscriptionId) {
-        var newSub = sub._recreate();
+
+
+      await Promise.all([...oldNamedSubs].map(async ([subscriptionId, sub]) => {
+        const newSub = sub._recreate();
         self._namedSubs.set(subscriptionId, newSub);
         // nb: if the handler throws or calls this.error(), it will in fact
         // immediately send its 'nosub'. This is OK, though.
-        newSub._runHandler();
-      });
+        await newSub._runHandler();
+      }));
 
       // Allow newly-created universal subs to be started on our connection in
       // parallel with the ones we're spinning up here, and spin up universal
       // subs.
       self._dontStartNewUniversalSubs = false;
       self.startUniversalSubs();
-    });
+    }, { name: '_setUserId' });
 
     // Start sending messages again, beginning with the diff from the previous
     // state of the world to the current state. No yields are allowed during
@@ -840,7 +948,7 @@ _.extend(Session.prototype, {
     Meteor._noYieldsAllowed(function () {
       self._isSending = true;
       self._diffCollectionViews(beforeCVs);
-      if (!_.isEmpty(self._pendingReady)) {
+      if (!isEmpty(self._pendingReady)) {
         self.sendReady(self._pendingReady);
         self._pendingReady = [];
       }
@@ -852,15 +960,22 @@ _.extend(Session.prototype, {
 
     var sub = new Subscription(
       self, handler, subId, params, name);
+
+    let unblockHander = self.cachedUnblock;
+    // _startSubscription may call from a lot places
+    // so cachedUnblock might be null in somecases
+    // assign the cachedUnblock
+    sub.unblock = unblockHander || (() => {});
+
     if (subId)
       self._namedSubs.set(subId, sub);
     else
       self._universalSubs.push(sub);
 
-    sub._runHandler();
+    return sub._runHandler();
   },
 
-  // tear down specified subscription
+  // Tear down specified subscription
   _stopSubscription: function (subId, error) {
     var self = this;
 
@@ -887,7 +1002,7 @@ _.extend(Session.prototype, {
     self.send(response);
   },
 
-  // tear down all subscriptions. Note that this does NOT send removed or nosub
+  // Tear down all subscriptions. Note that this does NOT send removed or nosub
   // messages, since we assume the client is gone.
   _deactivateAllSubscriptions: function () {
     var self = this;
@@ -922,7 +1037,7 @@ _.extend(Session.prototype, {
       return self.socket.remoteAddress;
 
     var forwardedFor = self.socket.headers["x-forwarded-for"];
-    if (! _.isString(forwardedFor))
+    if (!isString(forwardedFor))
       return null;
     forwardedFor = forwardedFor.trim().split(/\s*,\s*/);
 
@@ -946,7 +1061,7 @@ _.extend(Session.prototype, {
 /* Subscription                                                               */
 /******************************************************************************/
 
-// ctor for a sub handle: the input to each publish function
+// Ctor for a sub handle: the input to each publish function
 
 // Instance name is this because it's usually referred to as this inside a
 // publish
@@ -972,9 +1087,9 @@ var Subscription = function (
 
   self._handler = handler;
 
-  // my subscription ID (generated by client, undefined for universal subs).
+  // My subscription ID (generated by client, undefined for universal subs).
   self._subscriptionId = subscriptionId;
-  // undefined for universal subs
+  // Undefined for universal subs
   self._name = name;
 
   self._params = params || [];
@@ -988,17 +1103,17 @@ var Subscription = function (
     self._subscriptionHandle = 'U' + Random.id();
   }
 
-  // has _deactivate been called?
+  // Has _deactivate been called?
   self._deactivated = false;
 
-  // stop callbacks to g/c this sub.  called w/ zero arguments.
+  // Stop callbacks to g/c this sub.  called w/ zero arguments.
   self._stopCallbacks = [];
 
-  // the set of (collection, documentid) that this subscription has
-  // an opinion about
+  // The set of (collection, documentid) that this subscription has
+  // an opinion about.
   self._documents = new Map();
 
-  // remember if we are ready.
+  // Remember if we are ready.
   self._ready = false;
 
   // Part of the public API: the user of this sub.
@@ -1019,7 +1134,7 @@ var Subscription = function (
   // Later, you will be able to make this be "raw"
   // if you want to publish a collection that you know
   // just has strings for keys and no funny business, to
-  // a ddp consumer that isn't minimongo
+  // a DDP consumer that isn't minimongo.
 
   self._idFilter = {
     idStringify: MongoID.idStringify,
@@ -1030,8 +1145,8 @@ var Subscription = function (
     "livedata", "subscriptions", 1);
 };
 
-_.extend(Subscription.prototype, {
-  _runHandler: function () {
+Object.assign(Subscription.prototype, {
+  _runHandler: async function() {
     // XXX should we unblock() here? Either before running the publish
     // function, or before running _publishCursor.
     //
@@ -1039,17 +1154,26 @@ _.extend(Subscription.prototype, {
     // methods waiting on data from Mongo (or whatever else the function
     // blocks on). This probably slows page load in common cases.
 
-    var self = this;
+    if (!this.unblock) {
+      this.unblock = () => {};
+    }
+
+    const self = this;
+    let resultOrThenable = null;
     try {
-      var res = DDP._CurrentPublicationInvocation.withValue(
+      resultOrThenable = DDP._CurrentPublicationInvocation.withValue(
         self,
-        () => maybeAuditArgumentChecks(
-          self._handler, self, EJSON.clone(self._params),
-          // It's OK that this would look weird for universal subscriptions,
-          // because they have no arguments so there can never be an
-          // audit-argument-checks failure.
-          "publisher '" + self._name + "'"
-        )
+        () =>
+          maybeAuditArgumentChecks(
+            self._handler,
+            self,
+            EJSON.clone(self._params),
+            // It's OK that this would look weird for universal subscriptions,
+            // because they have no arguments so there can never be an
+            // audit-argument-checks failure.
+            "publisher '" + self._name + "'"
+          ),
+        { name: self._name }
       );
     } catch (e) {
       self.error(e);
@@ -1057,13 +1181,25 @@ _.extend(Subscription.prototype, {
     }
 
     // Did the handler call this.error or this.stop?
-    if (self._isDeactivated())
-      return;
+    if (self._isDeactivated()) return;
 
-    self._publishHandlerResult(res);
+    // Both conventional and async publish handler functions are supported.
+    // If an object is returned with a then() function, it is either a promise
+    // or thenable and will be resolved asynchronously.
+    const isThenable =
+      resultOrThenable && typeof resultOrThenable.then === 'function';
+    if (isThenable) {
+      try {
+        await self._publishHandlerResult(await resultOrThenable);
+      } catch(e) {
+        self.error(e)
+      }
+    } else {
+      await self._publishHandlerResult(resultOrThenable);
+    }
   },
 
-  _publishHandlerResult: function (res) {
+  async _publishHandlerResult (res) {
     // SPECIAL CASE: Instead of writing their own callbacks that invoke
     // this.added/changed/ready/etc, the user can just return a collection
     // cursor or array of cursors from the publish function; we call their
@@ -1087,7 +1223,7 @@ _.extend(Subscription.prototype, {
     };
     if (isCursor(res)) {
       try {
-        res._publishCursor(self);
+        await res._publishCursor(self);
       } catch (e) {
         self.error(e);
         return;
@@ -1095,38 +1231,37 @@ _.extend(Subscription.prototype, {
       // _publishCursor only returns after the initial added callbacks have run.
       // mark subscription as ready.
       self.ready();
-    } else if (_.isArray(res)) {
-      // check all the elements are cursors
-      if (! _.all(res, isCursor)) {
+    } else if (Array.isArray(res)) {
+      // Check all the elements are cursors
+      if (! res.every(isCursor)) {
         self.error(new Error("Publish function returned an array of non-Cursors"));
         return;
       }
-      // find duplicate collection names
+      // Find duplicate collection names
       // XXX we should support overlapping cursors, but that would require the
       // merge box to allow overlap within a subscription
       var collectionNames = {};
+
       for (var i = 0; i < res.length; ++i) {
         var collectionName = res[i]._getCollectionName();
-        if (_.has(collectionNames, collectionName)) {
+        if (collectionNames[collectionName]) {
           self.error(new Error(
             "Publish function returned multiple cursors for collection " +
               collectionName));
           return;
         }
         collectionNames[collectionName] = true;
-      };
+      }
 
       try {
-        _.each(res, function (cur) {
-          cur._publishCursor(self);
-        });
+        await Promise.all(res.map(cur => cur._publishCursor(self)));
       } catch (e) {
         self.error(e);
         return;
       }
       self.ready();
     } else if (res) {
-      // truthy values other than cursors or arrays are probably a
+      // Truthy values other than cursors or arrays are probably a
       // user mistake (possible returning a Mongo document via, say,
       // `coll.findOne()`).
       self.error(new Error("Publish function can only return a Cursor or "
@@ -1151,10 +1286,10 @@ _.extend(Subscription.prototype, {
 
   _callStopCallbacks: function () {
     var self = this;
-    // tell listeners, so they can clean up
+    // Tell listeners, so they can clean up
     var callbacks = self._stopCallbacks;
     self._stopCallbacks = [];
-    _.each(callbacks, function (callback) {
+    callbacks.forEach(function (callback) {
       callback();
     });
   },
@@ -1248,18 +1383,21 @@ _.extend(Subscription.prototype, {
    * @param {String} id The new document's ID.
    * @param {Object} fields The fields in the new document.  If `_id` is present it is ignored.
    */
-  added: function (collectionName, id, fields) {
-    var self = this;
-    if (self._isDeactivated())
+  added (collectionName, id, fields) {
+    if (this._isDeactivated())
       return;
-    id = self._idFilter.idStringify(id);
-    let ids = self._documents.get(collectionName);
-    if (ids == null) {
-      ids = new Set();
-      self._documents.set(collectionName, ids);
+    id = this._idFilter.idStringify(id);
+
+    if (this._session.server.getPublicationStrategy(collectionName).doAccountingForCollection) {
+      let ids = this._documents.get(collectionName);
+      if (ids == null) {
+        ids = new Set();
+        this._documents.set(collectionName, ids);
+      }
+      ids.add(id);
     }
-    ids.add(id);
-    self._session.added(self._subscriptionHandle, collectionName, id, fields);
+
+    this._session.added(this._subscriptionHandle, collectionName, id, fields);
   },
 
   /**
@@ -1271,12 +1409,11 @@ _.extend(Subscription.prototype, {
    * @param {String} id The changed document's ID.
    * @param {Object} fields The fields in the document that have changed, together with their new values.  If a field is not present in `fields` it was left unchanged; if it is present in `fields` and has a value of `undefined` it was removed from the document.  If `_id` is present it is ignored.
    */
-  changed: function (collectionName, id, fields) {
-    var self = this;
-    if (self._isDeactivated())
+  changed (collectionName, id, fields) {
+    if (this._isDeactivated())
       return;
-    id = self._idFilter.idStringify(id);
-    self._session.changed(self._subscriptionHandle, collectionName, id, fields);
+    id = this._idFilter.idStringify(id);
+    this._session.changed(this._subscriptionHandle, collectionName, id, fields);
   },
 
   /**
@@ -1287,15 +1424,18 @@ _.extend(Subscription.prototype, {
    * @param {String} collection The name of the collection that the document has been removed from.
    * @param {String} id The ID of the document that has been removed.
    */
-  removed: function (collectionName, id) {
-    var self = this;
-    if (self._isDeactivated())
+  removed (collectionName, id) {
+    if (this._isDeactivated())
       return;
-    id = self._idFilter.idStringify(id);
-    // We don't bother to delete sets of things in a collection if the
-    // collection is empty.  It could break _removeAllDocuments.
-    self._documents.get(collectionName).delete(id);
-    self._session.removed(self._subscriptionHandle, collectionName, id);
+    id = this._idFilter.idStringify(id);
+
+    if (this._session.server.getPublicationStrategy(collectionName).doAccountingForCollection) {
+      // We don't bother to delete sets of things in a collection if the
+      // collection is empty.  It could break _removeAllDocuments.
+      this._documents.get(collectionName).delete(id);
+    }
+
+    this._session.removed(this._subscriptionHandle, collectionName, id);
   },
 
   /**
@@ -1309,7 +1449,7 @@ _.extend(Subscription.prototype, {
     if (self._isDeactivated())
       return;
     if (!self._subscriptionId)
-      return;  // unnecessary but ignored for universal sub
+      return;  // Unnecessary but ignored for universal sub
     if (!self._ready) {
       self._session.sendReady([self._subscriptionId]);
       self._ready = true;
@@ -1321,7 +1461,7 @@ _.extend(Subscription.prototype, {
 /* Server                                                                     */
 /******************************************************************************/
 
-Server = function (options) {
+Server = function (options = {}) {
   var self = this;
 
   // The default heartbeat interval is 30 seconds on the server and 35
@@ -1331,12 +1471,14 @@ Server = function (options) {
   //
   // Note: Troposphere depends on the ability to mutate
   // Meteor.server.options.heartbeatTimeout! This is a hack, but it's life.
-  self.options = _.defaults(options || {}, {
+  self.options = {
     heartbeatInterval: 15000,
     heartbeatTimeout: 15000,
     // For testing, allow responding to pings to be disabled.
-    respondToPings: true
-  });
+    respondToPings: true,
+    defaultPublicationStrategy: publicationStrategies.SERVER_MERGE,
+    ...options,
+  };
 
   // Map of callbacks to call when a new connection comes in to the
   // server and completes DDP version negotiation. Use an object instead
@@ -1356,9 +1498,11 @@ Server = function (options) {
 
   self.method_handlers = {};
 
+  self._publicationStrategies = {};
+
   self.sessions = new Map(); // map from id to session
 
-  self.stream_server = new StreamServer;
+  self.stream_server = new StreamServer();
 
   self.stream_server.register(function (socket) {
     // socket implements the SockJSConnection interface
@@ -1392,9 +1536,9 @@ Server = function (options) {
             sendError("Already connected", msg);
             return;
           }
-          Fiber(function () {
-            self._handleConnect(socket, msg);
-          }).run();
+
+          self._handleConnect(socket, msg);
+
           return;
         }
 
@@ -1411,15 +1555,13 @@ Server = function (options) {
 
     socket.on('close', function () {
       if (socket._meteorSession) {
-        Fiber(function () {
-          socket._meteorSession.close();
-        }).run();
+        socket._meteorSession.close();
       }
     });
   });
 };
 
-_.extend(Server.prototype, {
+Object.assign(Server.prototype, {
 
   /**
    * @summary Register a callback to be called when a new DDP connection is made to the server.
@@ -1431,6 +1573,37 @@ _.extend(Server.prototype, {
   onConnection: function (fn) {
     var self = this;
     return self.onConnectionHook.register(fn);
+  },
+
+  /**
+   * @summary Set publication strategy for the given collection. Publications strategies are available from `DDPServer.publicationStrategies`. You call this method from `Meteor.server`, like `Meteor.server.setPublicationStrategy()`
+   * @locus Server
+   * @alias setPublicationStrategy
+   * @param collectionName {String}
+   * @param strategy {{useCollectionView: boolean, doAccountingForCollection: boolean}}
+   * @memberOf Meteor.server
+   * @importFromPackage meteor
+   */
+  setPublicationStrategy(collectionName, strategy) {
+    if (!Object.values(publicationStrategies).includes(strategy)) {
+      throw new Error(`Invalid merge strategy: ${strategy} 
+        for collection ${collectionName}`);
+    }
+    this._publicationStrategies[collectionName] = strategy;
+  },
+
+  /**
+   * @summary Gets the publication strategy for the requested collection. You call this method from `Meteor.server`, like `Meteor.server.getPublicationStrategy()`
+   * @locus Server
+   * @alias getPublicationStrategy
+   * @param collectionName {String}
+   * @memberOf Meteor.server
+   * @importFromPackage meteor
+   * @return {{useCollectionView: boolean, doAccountingForCollection: boolean}}
+   */
+  getPublicationStrategy(collectionName) {
+    return this._publicationStrategies[collectionName]
+      || this.options.defaultPublicationStrategy;
   },
 
   /**
@@ -1451,9 +1624,9 @@ _.extend(Server.prototype, {
     // The connect message must specify a version and an array of supported
     // versions, and it must claim to support what it is proposing.
     if (!(typeof (msg.version) === 'string' &&
-          _.isArray(msg.support) &&
-          _.all(msg.support, _.isString) &&
-          _.contains(msg.support, msg.version))) {
+          Array.isArray(msg.support) &&
+          msg.support.every(isString) &&
+          msg.support.includes(msg.version))) {
       socket.send(DDPCommon.stringifyDDP({msg: 'failed',
                                 version: DDPCommon.SUPPORTED_DDP_VERSIONS[0]}));
       socket.close();
@@ -1504,7 +1677,7 @@ _.extend(Server.prototype, {
    *  - (mostly internal) is_auto: true if generated automatically
    *    from an autopublish hook. this is for cosmetic purposes only
    *    (it lets us determine whether to print a warning suggesting
-   *    that you turn off autopublish.)
+   *    that you turn off autopublish).
    */
 
   /**
@@ -1518,7 +1691,7 @@ _.extend(Server.prototype, {
   publish: function (name, handler, options) {
     var self = this;
 
-    if (! _.isObject(name)) {
+    if (!isObject(name)) {
       options = options || {};
 
       if (name && name in self.publish_handlers) {
@@ -1528,12 +1701,12 @@ _.extend(Server.prototype, {
 
       if (Package.autopublish && !options.is_auto) {
         // They have autopublish on, yet they're trying to manually
-        // picking stuff to publish. They probably should turn off
+        // pick stuff to publish. They probably should turn off
         // autopublish. (This check isn't perfect -- if you create a
         // publish before you turn on autopublish, it won't catch
-        // it. But this will definitely handle the simple case where
+        // it, but this will definitely handle the simple case where
         // you've added the autopublish package to your app, and are
-        // calling publish from your app code.)
+        // calling publish from your app code).
         if (!self.warned_about_autopublish) {
           self.warned_about_autopublish = true;
           Meteor._debug(
@@ -1560,15 +1733,13 @@ _.extend(Server.prototype, {
         // self.sessions to change while we're running this loop.
         self.sessions.forEach(function (session) {
           if (!session._dontStartNewUniversalSubs) {
-            Fiber(function() {
-              session._startSubscription(handler);
-            }).run();
+            session._startSubscription(handler);
           }
         });
       }
     }
     else{
-      _.each(name, function(value, key) {
+      Object.entries(name).forEach(function([key, value]) {
         self.publish(key, value, {});
       });
     }
@@ -1580,6 +1751,17 @@ _.extend(Server.prototype, {
   },
 
   /**
+   * @summary Tells if the method call came from a call or a callAsync.
+   * @locus Anywhere
+   * @memberOf Meteor
+   * @importFromPackage meteor
+   * @returns boolean
+   */
+  isAsyncCall: function(){
+    return DDP._CurrentMethodInvocation._isCallAsyncMethodRunning()
+  },
+
+  /**
    * @summary Defines functions that can be invoked over the network by clients.
    * @locus Anywhere
    * @param {Object} methods Dictionary whose keys are method names and values are functions.
@@ -1588,7 +1770,7 @@ _.extend(Server.prototype, {
    */
   methods: function (methods) {
     var self = this;
-    _.each(methods, function (func, name) {
+    Object.entries(methods).forEach(function ([name, func]) {
       if (typeof func !== 'function')
         throw new Error("Method '" + name + "' must be a function");
       if (self.method_handlers[name])
@@ -1609,7 +1791,22 @@ _.extend(Server.prototype, {
 
   // A version of the call method that always returns a Promise.
   callAsync: function (name, ...args) {
-    return this.applyAsync(name, args);
+    const options = args[0]?.hasOwnProperty('returnStubValue')
+      ? args.shift()
+      : {};
+    DDP._CurrentMethodInvocation._setCallAsyncMethodRunning(true);
+    const promise = new Promise((resolve, reject) => {
+      DDP._CurrentCallAsyncInvocation._set({ name, hasCallAsyncParent: true });
+      this.applyAsync(name, args, { isFromCallAsync: true, ...options })
+        .then(resolve)
+        .catch(reject)
+        .finally(() => {
+          DDP._CurrentCallAsyncInvocation._set();
+        });
+    });
+    return promise.finally(() =>
+      DDP._CurrentMethodInvocation._setCallAsyncMethodRunning(false)
+    );
   },
 
   apply: function (name, args, options, callback) {
@@ -1621,21 +1818,20 @@ _.extend(Server.prototype, {
     } else {
       options = options || {};
     }
-
     const promise = this.applyAsync(name, args, options);
 
     // Return the result in whichever way the caller asked for it. Note that we
     // do NOT block on the write fence in an analogous way to how the client
     // blocks on the relevant data being visible, so you are NOT guaranteed that
     // cursor observe callbacks have fired when your callback is invoked. (We
-    // can change this if there's a real use case.)
+    // can change this if there's a real use case).
     if (callback) {
       promise.then(
         result => callback(undefined, result),
         exception => callback(exception)
       );
     } else {
-      return promise.await();
+      return promise;
     }
   },
 
@@ -1643,35 +1839,32 @@ _.extend(Server.prototype, {
   applyAsync: function (name, args, options) {
     // Run the handler
     var handler = this.method_handlers[name];
+
     if (! handler) {
       return Promise.reject(
         new Meteor.Error(404, `Method '${name}' not found`)
       );
     }
-
     // If this is a method call from within another method or publish function,
     // get the user state from the outer method or publish function, otherwise
     // don't allow setUserId to be called
     var userId = null;
-    var setUserId = function() {
+    let setUserId = () => {
       throw new Error("Can't call setUserId on a server initiated method call");
     };
     var connection = null;
     var currentMethodInvocation = DDP._CurrentMethodInvocation.get();
     var currentPublicationInvocation = DDP._CurrentPublicationInvocation.get();
     var randomSeed = null;
+
     if (currentMethodInvocation) {
       userId = currentMethodInvocation.userId;
-      setUserId = function(userId) {
-        currentMethodInvocation.setUserId(userId);
-      };
+      setUserId = (userId) => currentMethodInvocation.setUserId(userId);
       connection = currentMethodInvocation.connection;
       randomSeed = DDPCommon.makeRpcSeed(currentMethodInvocation, name);
     } else if (currentPublicationInvocation) {
       userId = currentPublicationInvocation.userId;
-      setUserId = function(userId) {
-        currentPublicationInvocation._session._setUserId(userId);
-      };
+      setUserId = (userId) => currentPublicationInvocation._session._setUserId(userId);
       connection = currentPublicationInvocation.connection;
     }
 
@@ -1683,15 +1876,25 @@ _.extend(Server.prototype, {
       randomSeed
     });
 
-    return new Promise(resolve => resolve(
-      DDP._CurrentMethodInvocation.withValue(
-        invocation,
-        () => maybeAuditArgumentChecks(
-          handler, invocation, EJSON.clone(args),
-          "internal call to '" + name + "'"
-        )
-      )
-    )).then(EJSON.clone);
+    return new Promise((resolve, reject) => {
+      let result;
+      try {
+        result = DDP._CurrentMethodInvocation.withValue(invocation, () =>
+          maybeAuditArgumentChecks(
+            handler,
+            invocation,
+            EJSON.clone(args),
+            "internal call to '" + name + "'"
+          )
+        );
+      } catch (e) {
+        return reject(e);
+      }
+      if (!Meteor._isPromise(result)) {
+        return resolve(result);
+      }
+      result.then(r => resolve(r)).catch(reject);
+    }).then(EJSON.clone);
   },
 
   _urlForSession: function (sessionId) {
@@ -1706,8 +1909,8 @@ _.extend(Server.prototype, {
 
 var calculateVersion = function (clientSupportedVersions,
                                  serverSupportedVersions) {
-  var correctVersion = _.find(clientSupportedVersions, function (version) {
-    return _.contains(serverSupportedVersions, version);
+  var correctVersion = clientSupportedVersions.find(function (version) {
+    return serverSupportedVersions.includes(version);
   });
   if (!correctVersion) {
     correctVersion = serverSupportedVersions[0];
@@ -1747,8 +1950,7 @@ var wrapInternalException = function (exception, context) {
 
   // Did the error contain more details that could have been useful if caught in
   // server code (or if thrown from non-client-originated code), but also
-  // provided a "sanitized" version with more context than 500 Internal server
-  // error? Use that.
+  // provided a "sanitized" version with more context than 500 Internal server error? Use that.
   if (exception.sanitizedError) {
     if (exception.sanitizedError.isClientSafe)
       return exception.sanitizedError;

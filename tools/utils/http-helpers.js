@@ -54,7 +54,7 @@ var WritableWithProgress = function (writable, listener) {
   self._listener = listener;
 };
 
-_.extend(WritableWithProgress.prototype, {
+Object.assign(WritableWithProgress.prototype, {
   write: function (chunk, encoding, callback) {
     var self = this;
     self._listener(chunk.length, false);
@@ -113,7 +113,7 @@ var getUserAgent = function () {
 
 
 var httpHelpers = exports;
-_.extend(exports, {
+Object.assign(exports, {
   getUserAgent: getUserAgent,
 
   // A wrapper around request with the following improvements:
@@ -206,7 +206,7 @@ _.extend(exports, {
       }
     }
 
-    options.headers = _.extend({
+    options.headers = Object.assign({
       'User-Agent': getUserAgent()
     }, options.headers || {});
 
@@ -363,13 +363,7 @@ _.extend(exports, {
     }
 
     if (promise) {
-      try {
-        return promise.await();
-      } finally {
-        if (progress) {
-          progress.reportProgressDone();
-        }
-      }
+      return promise.finally(() => progress && progress.reportProgressDone());
     } else {
       return req;
     }
@@ -410,9 +404,9 @@ _.extend(exports, {
   //
   // (This has gone through a few refactors and it might be possible
   // to fully roll it into httpHelpers.request() at this point.)
-  getUrl: function (urlOrOptions) {
+  getUrl: async function (urlOrOptions) {
     try {
-      var result = httpHelpers.request(urlOrOptions);
+      var result = await httpHelpers.request(urlOrOptions);
     } catch (e) {
       throw new files.OfflineError(e);
     }
@@ -436,7 +430,7 @@ _.extend(exports, {
   // We only use this for package downloads. In theory we could use it for
   // all requests but that seems like overkill and it isn't well tested in
   // other scenarioes.
-  getUrlWithResuming(urlOrOptions) {
+  async getUrlWithResuming(urlOrOptions) {
     const options = _.isObject(urlOrOptions) ? _.clone(urlOrOptions) : {
       url: urlOrOptions,
     };
@@ -495,8 +489,8 @@ _.extend(exports, {
       }
     }
 
-    const result = attempt().await();
-    const response = result.response
+    const result = await attempt();
+    const response = result.response;
     if (response.statusCode >= 400 && response.statusCode < 600) {
       const href = response.request.href;
       throw Error(`Could not get ${href}; server returned [${response.statusCode}]`);

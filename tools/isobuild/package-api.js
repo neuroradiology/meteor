@@ -1,4 +1,3 @@
-var assert = require("assert");
 var _ = require("underscore");
 var buildmessage = require('../utils/buildmessage.js');
 var utils = require('../utils/utils.js');
@@ -104,6 +103,7 @@ export class PackageAPI {
     });
 
     this.releaseRecords = [];
+    this.pendingPromises = [];
   }
 
   // Called when this package wants to make another package be
@@ -310,8 +310,12 @@ export class PackageAPI {
    * @param {String|String[]} filenames Paths to the source files.
    * @param {String|String[]} [architecture] If you only want to use the file
    * on the server (or the client), you can pass this argument
-   * (e.g., 'server', 'client', 'web.browser', 'web.cordova') to specify
-   * what architecture the file is used with. You can specify multiple
+   * (e.g., 'server', 'legacy', 'client', 'web.browser', 'web.cordova') to specify
+   * what architecture the file is used with. You can call api.addFiles(files, "legacy")
+   * in your package.js configuration file to add extra files to the legacy bundle,
+   * or api.addFiles(files, "client") to add files to all client bundles,
+   * or api.addFiles(files, "web.browser") to add files only to the modern bundle.
+   * You can specify multiple
    * architectures by passing in an array, for example
    * `['web.cordova', 'os.linux']`. By default, the file will be loaded on both
    * server and client.
@@ -545,15 +549,27 @@ export class PackageAPI {
                            { useMyCaller: true });
         return;
       }
-      var releaseRecord = catalog.official.getReleaseVersion(
-        relInf[0], relInf[1]);
-      if (!releaseRecord) {
-        buildmessage.error("Unknown release "+ release,
-                           { tags: { refreshCouldHelp: true } });
-      } else {
-        self.releaseRecords.push(releaseRecord);
-      }
+
+      let promise = catalog.official.getReleaseVersion(relInf[0], relInf[1])
+        .then(releaseRecord => {
+          if (!releaseRecord) {
+            buildmessage.error("Unknown release "+ release,
+                               { tags: { refreshCouldHelp: true } });
+          } else {
+            self.releaseRecords.push(releaseRecord);
+          }
+        });
+
+      this.pendingPromises.push(promise);
     }
+  }
+
+  // Internal method used by the meteor-tool
+  _waitForAsyncWork() {
+    let promises = this.pendingPromises;
+    this.pendingPromises = [];
+
+    return Promise.all(promises);
   }
 
   // Export symbols from this package.
@@ -622,6 +638,3 @@ export class PackageAPI {
     });
   }
 }
-
-// XXX COMPAT WITH 0.8.x
-PackageAPI.prototype.add_files = PackageAPI.prototype.addFiles;

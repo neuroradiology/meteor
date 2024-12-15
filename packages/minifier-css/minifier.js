@@ -1,6 +1,5 @@
 import path from 'path';
 import url from 'url';
-import Future from 'fibers/future';
 import postcss from 'postcss';
 import cssnano from 'cssnano';
 
@@ -14,7 +13,7 @@ const CssTools = {
    */
   parseCss(cssText, options = {}) {
     // This function previously used the `css-parse` npm package, which
-    // set the name of the css file being pased using  { source: 'filename' }.
+    // set the name of the css file being parsed using  { source: 'filename' }.
     // If included, we'll convert this to the `postcss` equivalent, to maintain
     // backwards compatibility.
     if (options.source) {
@@ -62,26 +61,24 @@ const CssTools = {
    * Minify the passed in CSS string.
    *
    * @param {string} cssText CSS string to minify.
-   * @return {String[]} Array containing the minified CSS.
+   * @return {Promise<String[]>} Array containing the minified CSS.
    */
   minifyCss(cssText) {
-    const f = new Future;
-    postcss([
-      cssnano({ safe: true }),
-    ]).process(cssText, {
-      from: void 0,
-    }).then(result => {
-      f.return(result.css);
-    }).catch(error => {
-      f.throw(error);
-    });
-    const minifiedCss = f.wait();
+    return CssTools.minifyCssAsync(cssText);
+  },
 
-    // Since this function has always returned an array, we'll wrap the
-    // minified css string in an array before returning, even though we're
-    // only ever returning one minified css string in that array (maintaining
-    // backwards compatibility).
-    return [minifiedCss];
+  /**
+   * Minify the passed in CSS string.
+   *
+   * @param {string} cssText CSS string to minify.
+   * @return {Promise<String[]>} Array containing the minified CSS.
+   */
+  async minifyCssAsync(cssText) {
+    return await postcss([cssnano({ safe: true })])
+      .process(cssText, {
+        from: void 0,
+      })
+      .then((result) => [result.css]);
   },
 
   /**
@@ -96,8 +93,13 @@ const CssTools = {
       if (! Array.isArray(rules)) {
         rules = [rules];
       }
-      return node =>
-        exclude ? !rules.includes(node.name) : rules.includes(node.name);
+      return node => {
+        // PostCSS AtRule nodes have `type: 'atrule'` and a descriptive name,
+        // e.g. 'import' or 'charset', while Comment nodes have type only.
+        const nodeMatchesRule = rules.includes(node.name || node.type);
+
+        return exclude ? !nodeMatchesRule : nodeMatchesRule;
+      }
     };
 
     // Simple concatenation of CSS files would break @import rules
@@ -182,6 +184,7 @@ if (typeof Profile !== 'undefined') {
     'parseCss',
     'stringifyCss',
     'minifyCss',
+    'minifyCssAsync',
     'mergeCssAsts',
     'rewriteCssUrls',
   ].forEach(funcName => {

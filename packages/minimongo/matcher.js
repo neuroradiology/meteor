@@ -5,6 +5,8 @@ import {
   nothingMatcher,
 } from './common.js';
 
+const Decimal = Package['mongo-decimal']?.Decimal || class DecimalStub {}
+
 // The minimongo selector compiler!
 
 // Terminology:
@@ -170,6 +172,10 @@ LocalCollection._f = {
       return 7;
     }
 
+    if (v instanceof Decimal) {
+      return 1;
+    }
+
     // object
     return 3;
 
@@ -256,12 +262,17 @@ LocalCollection._f = {
     if (ta === 9) { // Date
       // Convert to millis.
       ta = tb = 1;
-      a = a.getTime();
-      b = b.getTime();
+      a = isNaN(a) ? 0 : a.getTime();
+      b = isNaN(b) ? 0 : b.getTime();
     }
 
-    if (ta === 1) // double
-      return a - b;
+    if (ta === 1) { // double
+      if (a instanceof Decimal) {
+        return a.minus(b).toNumber();
+      } else {
+        return a - b;
+      }
+    }
 
     if (tb === 2) // string
       return a < b ? -1 : a === b ? 0 : 1;

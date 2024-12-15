@@ -1,4 +1,4 @@
-const Future = Meteor.isServer && require('fibers/future');
+import isEqual from "lodash.isequal";
 
 /******************************************************************************/
 /* TestCaseResults                                                            */
@@ -14,6 +14,10 @@ export class TestCaseResults {
     this.onException = onException;
     this.id = Random.id();
     this.extraDetails = {};
+  }
+
+  sleep(ms = 0) {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   ok(doc) {
@@ -186,6 +190,43 @@ export class TestCaseResults {
       this.ok();
   }
 
+  _assertActual(actual, predicate, message) {
+    if (actual && predicate(actual))
+      this.ok();
+    else
+      this.fail({
+        type: "throws",
+        message: (actual ?
+            "wrong error thrown: " + actual.message :
+            "did not throw an error as expected") + (message ? ": " + message : ""),
+      });
+  }
+
+  _guessPredicate(expected) {
+    let predicate;
+
+    if (expected === undefined) {
+      predicate = function () {
+        return true;
+      };
+    } else if (typeof expected === "string") {
+      predicate = function (actual) {
+        return typeof actual.message === "string" &&
+            actual.message.indexOf(expected) !== -1;
+      };
+    } else if (expected instanceof RegExp) {
+      predicate = function (actual) {
+        return expected.test(actual.message);
+      };
+    } else if (typeof expected === 'function') {
+      predicate = expected;
+    } else {
+      throw new Error('expected should be a string, regexp, or predicate function');
+    }
+
+    return predicate;
+  }
+
   // expected can be:
   //  undefined: accept any exception.
   //  string: pass if the string is a substring of the exception message.
@@ -203,27 +244,9 @@ export class TestCaseResults {
   // The upshot is, if you want to test whether an error is of a
   // particular class, use a predicate function.
   //
-  throws(f, expected) {
-    var actual, predicate;
-
-    if (expected === undefined) {
-      predicate = function (actual) {
-        return true;
-      };
-    } else if (typeof expected === "string") {
-      predicate = function (actual) {
-        return typeof actual.message === "string" &&
-               actual.message.indexOf(expected) !== -1;
-      };
-    } else if (expected instanceof RegExp) {
-      predicate = function (actual) {
-        return expected.test(actual.message);
-      };
-    } else if (typeof expected === 'function') {
-      predicate = expected;
-    } else {
-      throw new Error('expected should be a string, regexp, or predicate function');
-    }
+  throws(f, expected, message) {
+    let actual;
+    const predicate = this._guessPredicate(expected);
 
     try {
       f();
@@ -231,15 +254,26 @@ export class TestCaseResults {
       actual = exception;
     }
 
-    if (actual && predicate(actual))
-      this.ok();
-    else
-      this.fail({
-        type: "throws",
-        message: actual ?
-          "wrong error thrown: " + actual.message :
-          "did not throw an error as expected"
-      });
+    this._assertActual(actual, predicate, message);
+  }
+
+  /**
+   * Same as throw, but accepts an async function as a parameter.
+   * @param f
+   * @param expected
+   * @param message
+   * @returns {Promise<void>}
+   */
+  async throwsAsync(f, expected, message) {
+    let actual;
+    const predicate = this._guessPredicate(expected);
+
+    try {
+      await f();
+    } catch (exception) {
+      actual = exception;
+    }
+    this._assertActual(actual, predicate, message);
   }
 
   isTrue(v, msg) {
@@ -301,7 +335,7 @@ export class TestCaseResults {
   include(s, v, message, not) {
     var pass = false;
     if (s instanceof Array) {
-      pass = s.some(it => _.isEqual(v, it));
+      pass = s.some(it => isEqual(v, it));
     } else if (s && typeof s === "object") {
       pass = v in s;
     } else if (typeof s === "string") {
@@ -309,7 +343,7 @@ export class TestCaseResults {
         pass = true;
       }
     } else {
-      /* fail -- not something that contains other things */;
+      /* fail -- not something that contains other things */
     }
 
     if (pass === ! not) {
@@ -382,7 +416,7 @@ export class TestCase {
   // test raised (or voluntarily reported) an exception.
   run(onEvent, onComplete, onException, stop_at_offset) {
     let completed = false;
-
+    const self = this;
     return new Promise((resolve, reject) => {
       const results = new TestCaseResults(
         this,
@@ -392,6 +426,7 @@ export class TestCase {
           // test will display as "waiting" even when it counts as passed
           // or failed.
           if (completed) {
+            console.warn('Test name:', self.name);
             console.trace("event after complete!");
           }
           return onEvent(event);
@@ -400,9 +435,9 @@ export class TestCase {
         stop_at_offset
       );
 
-      const result = this.func(results, resolve);
+      const result = Meteor._runFresh(() => this.func(results, resolve));
       if (result && typeof result.then === "function") {
-        result.then(resolve, reject);
+        return result.then(resolve, reject);
       }
 
     }).then(
@@ -426,10 +461,11 @@ export const TestManager = new (class TestManager {
   constructor() {
     this.tests = {};
     this.ordered_tests = [];
-    this.testQueue = Meteor.isServer && new Meteor._SynchronousQueue();
+    this.testQueue = Meteor.isServer && new Meteor._AsynchronousQueue();
+    this.onlyTestsNames = [];
   }
 
-  addCase(test) {
+  addCase(test, options = {}) {
     if (test.name in this.tests)
       throw new Error(
         "Every test needs a unique name, but there are two tests named '" +
@@ -438,8 +474,29 @@ export const TestManager = new (class TestManager {
         test.name.indexOf(__meteor_runtime_config__.tinytestFilter) === -1) {
       return;
     }
+
+    if (options.isOnly) {
+      this.onlyTestsNames.push(test.name);
+    }
+
     this.tests[test.name] = test;
     this.ordered_tests.push(test);
+
+    if (this.onlyTestsNames.length){
+      this.tests = Object.entries(this.tests).reduce((acc, [key, value]) => {
+        if(this.onlyTestsNames.includes(key)){
+          return {...acc, [key]: value};
+        }
+        return acc;
+      }, {});
+
+      this.ordered_tests = this.ordered_tests.map(test => {
+        if (this.onlyTestsNames.includes(test.name)) {
+          return test;
+        }
+        return null;
+      }).filter(Boolean);
+    }
   }
 
   createRun(onReport, pathPrefix) {
@@ -478,8 +535,9 @@ export class TestRun {
 
   _runTest(test, onComplete, stop_at_offset) {
     var startTime = (+new Date);
+    Tinytest._currentRunningTestName = test.name;
 
-    test.run(event => {
+    return test.run(event => {
       /* onEvent */
       // Ignore result callbacks if the test has already been reported
       // as timed out.
@@ -524,41 +582,41 @@ export class TestRun {
     }
 
     if (Meteor.isServer) {
-      // On the server, ensure that only one test runs at a time, even
-      // with multiple clients.
       this.manager.testQueue.queueTask(() => {
-        // The future resolves when the test completes or times out.
-        var future = new Future();
-        Meteor.setTimeout(
-          () => {
-            if (future.isResolved())
-              // If the future has resolved the test has completed.
-              return;
-            test.timedOut = true;
-            this._report(test, {
-              type: "exception",
-              details: {
-                message: "test timed out"
-              }
-            });
-            future['return']();
-          },
-          3 * 60 * 1000  // 3 minutes
-        );
-        this._runTest(test, () => {
-          // The test can complete after it has timed out (it might
-          // just be slow), so only resolve the future if the test
-          // hasn't timed out.
-          if (! future.isResolved())
-            future['return']();
-        }, stop_at_offset);
-        // Wait for the test to complete or time out.
-        future.wait();
-        onComplete && onComplete();
+        // On the server, ensure that only one test runs at a time, even
+        // with multiple clients.
+        let hasRan = false;
+        const timeoutPromise = new Promise((resolve) => {
+          Meteor.setTimeout(() => {
+            if (!hasRan) {
+              test.timedOut = true;
+              this._report(test, {
+                type: "exception",
+                details: {
+                  message: "test timed out"
+                }
+              });
+            }
+
+            resolve();
+          }, 3 * 60 * 1000);
+        });
+        const runnerPromise = new Promise((resolve) => {
+          this._runTest(test, () => {
+            if (!hasRan) {
+              hasRan = true;
+            }
+            resolve();
+          }, stop_at_offset);
+        });
+
+        Promise.race([runnerPromise, timeoutPromise]).finally(() => {
+          onComplete && onComplete();
+        });
       });
     } else {
       // client
-      this._runTest(test, () => {
+      return this._runTest(test, () => {
         onComplete && onComplete();
       }, stop_at_offset);
     }
@@ -618,16 +676,25 @@ export class TestRun {
 /******************************************************************************/
 
 export const Tinytest = {};
+globalThis.__Tinytest = Tinytest;
 
-Tinytest.addAsync = function (name, func) {
-  TestManager.addCase(new TestCase(name, func));
+Tinytest.addAsync = function (name, func, options) {
+  TestManager.addCase(new TestCase(name, func), options);
 };
 
-Tinytest.add = function (name, func) {
+Tinytest.onlyAsync = function (name, func) {
+  Tinytest.addAsync(name, func, { isOnly: true });
+};
+
+Tinytest.add = function (name, func, options) {
   Tinytest.addAsync(name, function (test, onComplete) {
     func(test);
     onComplete();
-  });
+  }, options);
+};
+
+Tinytest.only = function (name, func) {
+  Tinytest.add(name, func, { isOnly: true });
 };
 
 // Run every test, asynchronously. Runs the test in the current
@@ -639,6 +706,22 @@ Tinytest._runTests = function (onReport, onComplete, pathPrefix) {
   var testRun = TestManager.createRun(onReport, pathPrefix);
   testRun.run(onComplete);
 };
+
+Tinytest._currentRunningTestName = ""
+
+Meteor.methods({
+  'tinytest/getCurrentRunningTestName'() {
+    return Tinytest._currentRunningTestName;
+  }
+})
+
+Tinytest._getCurrentRunningTestOnServer = function () {
+  return Meteor.callAsync('tinytest/getCurrentRunningTestName');
+}
+
+Tinytest._getCurrentRunningTestOnClient = function () {
+  return Tinytest._currentRunningTestName;
+}
 
 // Run just one test case, and stop the debugger at a particular
 // error, all as indicated by 'cookie', which will have come from a

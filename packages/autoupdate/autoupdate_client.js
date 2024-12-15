@@ -42,10 +42,10 @@ export const Autoupdate = {};
 
 // Stores acceptable client versions.
 const clientVersions =
-  Autoupdate._clientVersions = // Used by a self-test.
+  Autoupdate._clientVersions = // Used by a self-test and hot-module-replacement
   new ClientVersions();
 
-Meteor.connection.registerStore(
+Meteor.connection.registerStoreClient(
   "meteor_autoupdate_clientVersions",
   clientVersions.createStore()
 );

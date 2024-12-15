@@ -1,12 +1,9 @@
 import _ from 'underscore';
-import util from 'util';
-import path from 'path';
+import url from 'url';
 import { Console } from '../console/console.js';
 import buildmessage from '../utils/buildmessage.js';
 import files from '../fs/files';
 import { optimisticReadJsonOrNull } from "../fs/optimistic";
-import bundler from '../isobuild/bundler.js';
-import archinfo from '../utils/archinfo';
 import release from '../packaging/release.js';
 import { loadIsopackage } from '../tool-env/isopackets.js';
 import utils from '../utils/utils.js';
@@ -49,33 +46,25 @@ const iconsAndroidSizes = {
   'android_xxxhdpi': '192x192'
 };
 
-const launchIosSizes = {
-  'iphone5': '640x1136',
-  'iphone6': '750x1334',
-  'iphone6p_portrait': '1242x2208',
-  'iphone6p_landscape': '2208x1242',
-  'iphoneX_portrait': '1125x2436',
-  'iphoneX_landscape': '2436x1125',
-  'ipad_portrait_2x': '1536x2048',
-  'ipad_landscape_2x': '2048x1536',
-  // Legacy
-  'iphone': '320x480',
-  'iphone_2x': '640x960',
-  'ipad_portrait': '768x1024',
-  'ipad_landscape': '1024x768'
+const splashIosKeys = {
+  'ios_universal': 'Default@2x~universal~anyany.png',
+  'ios_universal_3x': 'Default@3x~universal~anyany.png',
+  'Default@2x~universal~comany': 'Default@2x~universal~comany.png',
+  'Default@2x~universal~comcom': 'Default@2x~universal~comcom.png',
+  'Default@3x~universal~anycom': 'Default@3x~universal~anycom.png',
+  'Default@3x~universal~comany': 'Default@3x~universal~comany.png',
+  'Default@2x~iphone~anyany': 'Default@2x~iphone~anyany.png',
+  'Default@2x~iphone~comany': 'Default@2x~iphone~comany.png',
+  'Default@2x~iphone~comcom': 'Default@2x~iphone~comcom.png',
+  'Default@3x~iphone~anyany': 'Default@3x~iphone~anyany.png',
+  'Default@3x~iphone~anycom': 'Default@3x~iphone~anycom.png',
+  'Default@3x~iphone~comany': 'Default@3x~iphone~comany.png',
+  'Default@2x~ipad~anyany': 'Default@2x~ipad~anyany.png',
+  'Default@2x~ipad~comany': 'Default@2x~ipad~comany.png'
 };
 
-const launchAndroidSizes = {
-  'android_mdpi_portrait': '320x480',
-  'android_mdpi_landscape': '480x320',
-  'android_hdpi_portrait': '480x800',
-  'android_hdpi_landscape': '800x480',
-  'android_xhdpi_portrait': '720x1280',
-  'android_xhdpi_landscape': '1280x720',
-  'android_xxhdpi_portrait': '960x1600',
-  'android_xxhdpi_landscape': '1600x960',
-  'android_xxxhdpi_portrait': '1280x1920',
-  'android_xxxhdpi_landscape': '1920x1280'
+const splashAndroidKeys = {
+  'android_universal': 'AndroidWindowSplashScreenAnimatedIcon',
 };
 
 export class CordovaBuilder {
@@ -91,18 +80,24 @@ export class CordovaBuilder {
     this.initalizeDefaults();
   }
 
+  static createCordovaServerPort(appIdentifier) {
+    // Convert the appId (a base 36 string) to a number
+    const appIdAsNumber = parseInt(appIdentifier, 36);
+    // We use the appId to choose a local server port between 12000-13000.
+    // This range should be large enough to avoid collisions with other
+    // Meteor apps, and has also been chosen to avoid collisions
+    // with other apps or services on the device (although this can never be
+    // guaranteed).
+    return 12000 + (appIdAsNumber % 1000);
+  }
+
   initalizeDefaults() {
     let { cordovaServerPort } = this.options;
     // if --cordova-server-port is not present on run command
     if (!cordovaServerPort) {
-      // Convert the appId (a base 36 string) to a number
-      const appIdAsNumber = parseInt(this.projectContext.appIdentifier, 36);
-      // We use the appId to choose a local server port between 12000-13000.
-      // This range should be large enough to avoid collisions with other
-      // Meteor apps, and has also been chosen to avoid collisions
-      // with other apps or services on the device (although this can never be
-      // guaranteed).
-      cordovaServerPort = 12000 + (appIdAsNumber % 1000);
+      cordovaServerPort = CordovaBuilder.createCordovaServerPort(
+        this.projectContext.appIdentifier
+      );
     }
 
     this.metadata = {
@@ -127,7 +122,14 @@ export class CordovaBuilder {
       },
       platform: {
         ios: {},
-        android: {}
+        android: {
+          "AndroidXEnabled": true,
+          // We still use a port based on appId on iOS to avoid conflits on local webserver.
+          // We don't need it on android, but the contentUrl can only be one, and we set this
+          // here to be able to intercept these calls.
+          "hostname": `localhost:${cordovaServerPort}`,
+          "AndroidInsecureFileModeEnabled": true
+        }
       }
     };
 
@@ -139,21 +141,13 @@ export class CordovaBuilder {
 
     const packageMap = this.projectContext.packageMap;
 
-    if (packageMap && packageMap.getInfo('launch-screen')) {
-      this.additionalConfiguration.global.AutoHideSplashScreen = false;
-      this.additionalConfiguration.global.SplashScreen = 'screen';
-      this.additionalConfiguration.global.SplashScreenDelay = 5000;
-      this.additionalConfiguration.global.FadeSplashScreenDuration = 250;
-      this.additionalConfiguration.global.ShowSplashScreenSpinner = false;
-    }
-
     if (packageMap && packageMap.getInfo('mobile-status-bar')) {
       this.additionalConfiguration.global.StatusBarOverlaysWebView = false;
       this.additionalConfiguration.global.StatusBarStyle = 'default';
     }
 
     // Default access rules.
-    // Rules can be extended with App.accesRule() in mobile-config.js.
+    // Rules can be extended with App.accessRule() in mobile-config.js.
     this.accessRules = {
       // Allow the app to ask the system to open these types of URLs.
       // (e.g. in the phone app or an email client)
@@ -210,22 +204,23 @@ export class CordovaBuilder {
       }
     };
 
-    const setDefaultLaunchScreen = (size, name) => {
-      const imageFile = files.pathJoin(launchScreensPath, `${size}.png`);
+    const setDefaultLaunchScreen = (key) => {
+      const imageFile = files.pathJoin(launchScreensPath, `${key}.png`);
       if (files.exists(imageFile)) {
-        this.imagePaths.splash[name] = imageFile;
+        this.imagePaths.splash[key] = imageFile;
       }
     };
 
     _.each(iconsIosSizes, setDefaultIcon);
     _.each(iconsAndroidSizes, setDefaultIcon);
-    _.each(launchIosSizes, setDefaultLaunchScreen);
-    _.each(launchAndroidSizes, setDefaultLaunchScreen);
+
+    setDefaultLaunchScreen('ios_universal');
+    setDefaultLaunchScreen('android_universal');
 
     this.pluginsConfiguration = {};
   }
 
-  processControlFile() {
+  async processControlFile() {
     const controlFilePath =
       files.pathJoin(this.projectContext.projectDir, 'mobile-config.js');
 
@@ -233,11 +228,11 @@ export class CordovaBuilder {
     if (files.exists(controlFilePath)) {
       Console.debug('Processing mobile-config.js');
 
-      buildmessage.enterJob({ title: `processing mobile-config.js` }, () => {
+      await buildmessage.enterJob({ title: `processing mobile-config.js` }, async () => {
         const code = files.readFile(controlFilePath, 'utf8');
 
         try {
-          files.runJavaScript(code, {
+          await files.runJavaScript(code, {
             filename: 'mobile-config.js',
             symbols: { App: createAppConfiguration(this) }
           });
@@ -248,7 +243,7 @@ export class CordovaBuilder {
     }
   }
 
-  writeConfigXmlAndCopyResources(shouldCopyResources = true) {
+  async writeConfigXmlAndCopyResources(shouldCopyResources = true) {
     let config = XmlBuilder.create({ version: '1.0' }).ele('widget');
 
     // Set the root attributes
@@ -258,7 +253,8 @@ export class CordovaBuilder {
       'android-versionCode': this.metadata.buildNumber,
       'ios-CFBundleVersion': this.metadata.buildNumber,
       xmlns: 'http://www.w3.org/ns/widgets',
-      'xmlns:cdv': 'http://cordova.apache.org/ns/1.0'
+      'xmlns:cdv': 'http://cordova.apache.org/ns/1.0',
+      'xmlns:android': 'http://schemas.android.com/apk/res/android'
     }, (value, key) => {
       if (value) {
         config.att(key, value);
@@ -296,9 +292,9 @@ export class CordovaBuilder {
       if (type === 'intent') {
         config.ele('allow-intent', { href: pattern });
       } else if (type === 'navigation') {
-        config.ele('allow-navigation', _.extend({ href: pattern }, options));
+        config.ele('allow-navigation', Object.assign({ href: pattern }, options));
       } else {
-        config.ele('access', _.extend({ origin: pattern }, options));
+        config.ele('access', Object.assign({ origin: pattern }, options));
       }
     });
 
@@ -317,17 +313,26 @@ export class CordovaBuilder {
       });
     });
 
+    // allow http communication only in development mode
+    if(process.env.NODE_ENV !== 'production') {
+      platformElement.android.ele("edit-config")
+          .att("file", "app/src/main/AndroidManifest.xml")
+          .att("mode", "merge")
+          .att("target", "/manifest/application")
+          .ele("application")
+          .att("android:usesCleartextTraffic", "true");
+    }
     if (shouldCopyResources) {
       // Prepare the resources folder
-      files.rm_recursive(this.resourcesPath);
+      await files.rm_recursive(this.resourcesPath);
       files.mkdir_p(this.resourcesPath);
 
       Console.debug('Copying resources for mobile apps');
 
-      this.configureAndCopyImages(iconsIosSizes, platformElement.ios, 'icon');
-      this.configureAndCopyImages(iconsAndroidSizes, platformElement.android, 'icon');
-      this.configureAndCopyImages(launchIosSizes, platformElement.ios, 'splash');
-      this.configureAndCopyImages(launchAndroidSizes, platformElement.android, 'splash');
+      this._configureAndCopyIcon(iconsIosSizes, platformElement.ios);
+      this._configureAndCopyIcon(iconsAndroidSizes, platformElement.android);
+      this._configureAndCopySplashImages(splashIosKeys, platformElement.ios, true);
+      this._configureAndCopySplashImages(splashAndroidKeys, platformElement.android);
     }
 
     this.configureAndCopyResourceFiles(
@@ -343,51 +348,95 @@ export class CordovaBuilder {
     files.writeFile(configXmlPath, formattedXmlConfig, 'utf8');
   }
 
-  configureAndCopyImages(sizes, xmlElement, tag) {
-    const imageAttributes = (name, width, height, src) => {
-      const androidMatch = /android_(.?.dpi)_(landscape|portrait)/g.exec(name);
+  _copyImageToBuildFolderAndAppendToXmlNode(suppliedPath, newFilename, xmlElement, tag, attributes = {}) {
+    const src = files.pathJoin('resources', newFilename);
 
-      let attributes = {
-        src: src,
-        width: width,
-        height: height
-      };
+    files.copyFile(
+        files.pathResolve(this.projectContext.projectDir, suppliedPath),
+        files.pathJoin(this.resourcesPath, newFilename));
 
-      // XXX special case for Android
-      if (androidMatch) {
-        attributes.density =
-          androidMatch[2].substr(0, 4) + '-' + androidMatch[1];
+    // Set it to the xml tree
+    xmlElement.ele(tag, { ...(tag === "preference" ? { value: src } : { src }), ...attributes });
+  }
+
+  _resolveFilenameForImages = (suppliedPath, key, tag) => {
+    const suppliedFilename = _.last(suppliedPath.split(files.pathSep));
+    let extension = _.last(suppliedFilename.split('.'));
+
+    // XXX special case for 9-patch png's
+    if (suppliedFilename.match(/\.9\.png$/)) {
+      extension = '9.png';
+    }
+
+    return `${key}.${tag}.${extension}`;
+  }
+
+  _configureAndCopyIcon(sizes, xmlElement) {
+    if (!sizes || !xmlElement) {
+      throw new Error("Invalid parameters")
+    }
+
+    Object.entries(sizes).forEach(([key, size]) => {
+      const suppliedPath = this.imagePaths['icon'][key];
+      if (!suppliedPath) return;
+
+      const [width, height] = size.split('x');
+      const filename = this._resolveFilenameForImages(suppliedPath, key, 'icon');
+      this._copyImageToBuildFolderAndAppendToXmlNode(suppliedPath, filename, xmlElement, 'icon', { width, height })
+    })
+  }
+
+  _configureAndCopySplashImages(allowedValues, xmlElement, isIos = false) {
+    const appendDarkMode = (stringValue , { separator = '.', withChar = '~' } = {}) => {
+      if (!stringValue) {
+        throw new Error("No string was passed.");
       }
 
-      return attributes;
-    };
+      const darkModeIdentifier = isIos ? 'dark' : 'night';
+      const lastIndexOfSeparator = stringValue.lastIndexOf(separator);
 
-    _.each(sizes, (size, name) => {
-      const [width, height] = size.split('x');
+      if (!lastIndexOfSeparator) {
+        throw new Error("Invalid src value!");
+      }
 
-      const suppliedPath = this.imagePaths[tag][name];
-      if (!suppliedPath) {
+      return `${stringValue.substring(0, lastIndexOfSeparator)}${withChar}${darkModeIdentifier}${stringValue.substring(lastIndexOfSeparator)}`;
+    }
+
+    Object.entries(allowedValues).forEach(([key, value]) => {
+      const suppliedValue = this.imagePaths['splash'][key];
+      if (!suppliedValue) return;
+
+      let suppliedPath = suppliedValue;
+      let suppliedPathDarkMode = null;
+      if (typeof suppliedValue === 'object') {
+        if (isIos) {
+          suppliedPath = suppliedValue.src;
+          suppliedPathDarkMode = suppliedValue.srcDarkMode;
+        } else {
+         throw new Error("Dark mode through Meteor's launch screen helper is only allowed for iOS. For android, please follow the instructions: https://developer.android.com/develop/ui/views/theming/darktheme.");
+        }
+      }
+
+      if (isIos) {
+        if (suppliedPathDarkMode) {
+          this._copyImageToBuildFolderAndAppendToXmlNode(suppliedPathDarkMode,
+              appendDarkMode(value),
+              xmlElement,
+              'splash');
+        }
+        this._copyImageToBuildFolderAndAppendToXmlNode(suppliedPath,
+            value,
+            xmlElement,
+            'splash');
         return;
       }
 
-      const suppliedFilename = _.last(suppliedPath.split(files.pathSep));
-      let extension = _.last(suppliedFilename.split('.'));
-
-      // XXX special case for 9-patch png's
-      if (suppliedFilename.match(/\.9\.png$/)) {
-        extension = '9.png';
-      }
-
-      const filename = name + '.' + tag + '.' + extension;
-      const src = files.pathJoin('resources', filename);
-
-      // Copy the file to the build folder with a standardized name
-      files.copyFile(
-        files.pathResolve(this.projectContext.projectDir, suppliedPath),
-        files.pathJoin(this.resourcesPath, filename));
-
-      // Set it to the xml tree
-      xmlElement.ele(tag, imageAttributes(name, width, height, src));
+      const filename = this._resolveFilenameForImages(suppliedPath, key, 'splash');
+      this._copyImageToBuildFolderAndAppendToXmlNode(suppliedPath,
+          filename,
+          xmlElement,
+          'preference',
+          { name: value });
     });
   }
 
@@ -416,11 +465,11 @@ export class CordovaBuilder {
     });
   }
 
-  copyWWW(bundlePath) {
+  async copyWWW(bundlePath) {
     const wwwPath = files.pathJoin(this.projectRoot, 'www');
 
     // Remove existing www
-    files.rm_recursive(wwwPath);
+    await files.rm_recursive(wwwPath);
 
     // Create www and www/application directories
     const applicationPath = files.pathJoin(wwwPath, 'application');
@@ -428,7 +477,7 @@ export class CordovaBuilder {
 
     // Copy Cordova arch program from bundle to www/application
     const programPath = files.pathJoin(bundlePath, 'programs', CORDOVA_ARCH);
-    files.cp_r(programPath, applicationPath);
+    await files.cp_r(programPath, applicationPath);
 
     // Load program.json
     const programJsonPath = files.convertToOSPath(
@@ -442,20 +491,20 @@ export class CordovaBuilder {
     const publicSettings = settings['public'];
 
     // Calculate client hash and append to program
-    this.appendVersion(program, publicSettings);
+    await this.appendVersion(program, publicSettings);
 
     // Write program.json
     files.writeFile(programJsonPath, JSON.stringify(program), 'utf8');
 
-    const bootstrapPage = this.generateBootstrapPage(
+    const bootstrapPage = await this.generateBootstrapPage(
       applicationPath, program, publicSettings
-    ).await();
+    );
 
     files.writeFile(files.pathJoin(applicationPath, 'index.html'),
       bootstrapPage, 'utf8');
   }
 
-  appendVersion(program, publicSettings) {
+  async appendVersion(program, publicSettings) {
     // Note: these version calculations must be kept in agreement with
     // generateClientProgram in packages/webapp/webapp_server.js, or hot
     // code push will reload the app unnecessarily.
@@ -463,7 +512,7 @@ export class CordovaBuilder {
     let configDummy = {};
     configDummy.PUBLIC_SETTINGS = publicSettings || {};
 
-    const { WebAppHashing } = loadIsopackage('webapp-hashing');
+    const { WebAppHashing } = await loadIsopackage('webapp-hashing');
     const { AUTOUPDATE_VERSION } = process.env;
 
     program.version = AUTOUPDATE_VERSION ||
@@ -476,30 +525,46 @@ export class CordovaBuilder {
 
     program.versionNonRefreshable = AUTOUPDATE_VERSION ||
       WebAppHashing.calculateClientHash(
-        program.manifest, type => type !== "css", configDummy);
+        program.manifest,
+        (type, replaceable) => type !== "css" && !replaceable,
+        configDummy
+      );
+
+    program.versionReplaceable = AUTOUPDATE_VERSION ||
+      WebAppHashing.calculateClientHash(
+        program.manifest,
+        (_type, replaceable) => replaceable,
+        configDummy
+      );
   }
 
-  generateBootstrapPage(applicationPath, program, publicSettings) {
+  async generateBootstrapPage(applicationPath, program, publicSettings) {
     const meteorRelease =
       release.current.isCheckout() ? "none" : release.current.name;
+    const hmrVersion =
+      this.options.buildMode === 'development' ? Date.now() : undefined
 
     const manifest = program.manifest;
 
     const mobileServerUrl = this.options.mobileServerUrl;
+
+    const parsedUrl = url.parse(mobileServerUrl);
 
     const runtimeConfig = {
       meteorRelease: meteorRelease,
       gitCommitHash: process.env.METEOR_GIT_COMMIT_HASH || files.findGitCommitHash(applicationPath),
       ROOT_URL: mobileServerUrl,
       // XXX propagate it from this.options?
-      ROOT_URL_PATH_PREFIX: '',
-      DDP_DEFAULT_CONNECTION_URL: mobileServerUrl,
+      ROOT_URL_PATH_PREFIX: parsedUrl.pathname.replace(/\/$/,"") || '',
+      DDP_DEFAULT_CONNECTION_URL: process.env.DDP_DEFAULT_CONNECTION_URL || mobileServerUrl,
       autoupdate: {
         versions: {
           "web.cordova": {
             version: program.version,
             versionRefreshable: program.versionRefreshable,
-            versionNonRefreshable: program.versionNonRefreshable
+            versionNonRefreshable: program.versionNonRefreshable,
+            versionReplaceable: program.versionReplaceable,
+            versionHmr: hmrVersion
           }
         }
       },
@@ -514,7 +579,7 @@ export class CordovaBuilder {
       runtimeConfig.PUBLIC_SETTINGS = publicSettings;
     }
 
-    const { Boilerplate } = loadIsopackage('boilerplate-generator');
+    const { Boilerplate } = await loadIsopackage('boilerplate-generator');
 
     const boilerplate = new Boilerplate(CORDOVA_ARCH, manifest, {
       urlMapper: _.identity,
@@ -529,14 +594,14 @@ export class CordovaBuilder {
     return boilerplate.toHTMLAsync();
   }
 
-  copyBuildOverride() {
+  async copyBuildOverride() {
     const buildOverridePath =
       files.pathJoin(this.projectContext.projectDir, 'cordova-build-override');
 
     if (files.exists(buildOverridePath) &&
       files.stat(buildOverridePath).isDirectory()) {
       Console.debug('Copying over the cordova-build-override directory');
-      files.cp_r(buildOverridePath, this.projectRoot);
+      await files.cp_r(buildOverridePath, this.projectRoot);
     }
   }
 }
@@ -573,7 +638,7 @@ function createAppConfiguration(builder) {
         }
       });
 
-      _.extend(builder.metadata, options);
+      Object.assign(builder.metadata, options);
     },
     /**
      * @summary Add a preference for your build as described in the
@@ -586,7 +651,7 @@ function createAppConfiguration(builder) {
      */
     setPreference: function (key, value, platform) {
       if (platform) {
-        if (!_.contains(['ios', 'android'], platform)) {
+        if (!['ios', 'android'].includes(platform)) {
           throw new Error(`Unknown platform in App.setPreference: ${platform}. \
 Valid platforms are: ios, android.`);
         }
@@ -655,63 +720,68 @@ Valid platforms are: ios, android.`);
      */
     icons: function (icons) {
       var validDevices =
-        _.keys(iconsIosSizes).concat(_.keys(iconsAndroidSizes));
+        Object.keys(iconsIosSizes).concat(Object.keys(iconsAndroidSizes));
       _.each(icons, function (value, key) {
         if (!_.include(validDevices, key)) {
           Console.labelWarn(`${key}: unknown key in App.icons \
 configuration. The key may be deprecated.`);
         }
       });
-      _.extend(builder.imagePaths.icon, icons);
+      Object.assign(builder.imagePaths.icon, icons);
     },
 
     /**
      * @summary Set the launch screen images for your mobile app.
      * @param {Object} launchScreens A dictionary where keys are different
      * devices, screen sizes, and orientations, and the values are image paths
-     * relative to the project root directory.
+     * relative to the project root directory or an object containing a dark mode image path too `{ src, srcDarkMode }` (iOS only).
+     * Note: If you want to have a dark theme splash screen on Android, please follow the instructions described [here](https://developer.android.com/develop/ui/views/theming/darktheme).
      *
-     * For Android, launch screen images should
-     * be special "Nine-patch" image files that specify how they should be
-     * stretched. See the [Android docs](https://developer.android.com/guide/topics/graphics/2d-graphics.html#nine-patch).
+     * For Android specific information, check the [Cordova docs](https://cordova.apache.org/docs/en/latest/core/features/splashscreen/index.html#android-specific-information) and [Android docs](https://developer.android.com/develop/ui/views/launch/splash-screen#splash_screen_dimensions).
+     * Also note that for android the asset can either be an XML Vector Drawable or PNG.
+     *
+     * For best practices when developing a splash image, see the [Apple Guidelines](https://developer.apple.com/design/human-interface-guidelines/ios/visual-design/launch-screen/).
+     * To learn more about size classes for iOS, check out the [documentation](https://cordova.apache.org/docs/en/10.x/reference/cordova-plugin-splashscreen/#size-classes) from Cordova.
      *
      * Valid key values:
-     * - `iphone5` (640x1136) // iPhone 5, SE
-     * - `iphone6` (750x1334) // iPhone 6, 6s, 7, 8
-     * - `iphone6p_portrait` (1242x2208) // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus
-     * - `iphone6p_landscape` (2208x1242) // iPhone 6 Plus, 6s Plus, 7 Plus, 8 Plus
-     * - `iphoneX_portrait` (1125x2436) // iPhone X
-     * - `iphoneX_landscape` (2436x1125) // iPhone X
-     * - `ipad_portrait_2x` (1536x2048) // iPad, iPad mini
-     * - `ipad_landscape_2x` (2048x1536) // iPad, iPad mini
-     * - `iphone` (320x480) // Legacy
-     * - `iphone_2x` (640x960) // Legacy
-     * - `ipad_portrait` (768x1024) // Legacy
-     * - `ipad_landscape` (1024x768) // Legacy
-     * - `android_mdpi_portrait` (320x480)
-     * - `android_mdpi_landscape` (480x320)
-     * - `android_hdpi_portrait` (480x800)
-     * - `android_hdpi_landscape` (800x480)
-     * - `android_xhdpi_portrait` (720x1280)
-     * - `android_xhdpi_landscape` (1280x720)
-     * - `android_xxhdpi_portrait` (960x1600)
-     * - `android_xxhdpi_landscape` (1600x960)
-     * - `android_xxxhdpi_portrait` (1280x1920)
-     * - `android_xxxhdpi_landscape` (1920x1280)
+     *
+     * iOS:
+     *  - `ios_universal` (Default@2xuniversalanyany.png - 2732x2732 px) - All @2x devices, if device/mode specific is not declared
+     *  - `ios_universal_3x` (Default@3xuniversalanyany.png - 2208x2208 px) - All @3x devices, if device/mode specific is not declared
+     *  - `Default@2x~universal~comany` (1278x2732 px) - All @2x devices in portrait mode
+     *  - `Default@2x~universal~comcom` (1334x750 px) - All @2x devices in landscape (narrow) mode
+     *  - `Default@3x~universal~anycom` (2208x1242 px) - All @3x devices in landscape (wide) mode
+     *  - `Default@3x~universal~comany` (1242x2208 px) - All @3x devices in portrait mode
+     *  - `Default@2x~iphone~anyany` (1334x1334 px) - iPhone SE/6s/7/8/XR
+     *  - `Default@2x~iphone~comany` (750x1334 px) - iPhone SE/6s/7/8/XR - portrait mode
+     *  - `Default@2x~iphone~comcom` (1334x750 px) - iPhone SE/6s/7/8/XR - landscape (narrow) mode
+     *  - `Default@3x~iphone~anyany` (2208x2208 px) - iPhone 6s Plus/7 Plus/8 Plus/X/XS/XS Max
+     *  - `Default@3x~iphone~anycom` (2208x1242 px) - iPhone 6s Plus/7 Plus/8 Plus/X/XS/XS Max - landscape (wide) mode
+     *  - `Default@3x~iphone~comany` (1242x2208 px) - iPhone 6s Plus/7 Plus/8 Plus/X/XS/XS Max - portrait mode
+     *  - `Default@2x~ipad~anyany` (2732x2732 px) - iPad Pro 12.9"/11"/10.5"/9.7"/7.9"
+     *  - `Default@2x~ipad~comany` (1278x2732 px) - iPad Pro 12.9"/11"/10.5"/9.7"/7.9" - portrait mode
+     *
+     * Android:
+     *  - `android_universal` (288x288 dp)
      *
      * @memberOf App
      */
     launchScreens: function (launchScreens) {
-      var validDevices =
-        _.keys(launchIosSizes).concat(_.keys(launchAndroidSizes));
+      const validDevices =
+        Object.keys(splashIosKeys).concat(Object.keys(splashAndroidKeys));
 
-      _.each(launchScreens, function (value, key) {
-        if (!_.include(validDevices, key)) {
+      Object.keys(launchScreens).forEach((key) => {
+        if (!validDevices.includes(key)) {
           Console.labelWarn(`${key}: unknown key in App.launchScreens \
 configuration. The key may be deprecated.`);
         }
+
+        const value = launchScreens[key];
+        if (typeof value !== "string" && key.includes("android")) {
+          throw new Error("Android splash screen path must be a string. To enable dark splash screens for your app, check out the android developer guide: https://developer.android.com/develop/ui/views/theming/darktheme.");
+        }
       });
-      _.extend(builder.imagePaths.splash, launchScreens);
+      Object.assign(builder.imagePaths.splash, launchScreens);
     },
 
     /**
@@ -773,7 +843,7 @@ configuration. The key may be deprecated.`);
      * [Cordova documentation](http://cordova.apache.org/docs/en/7.x/config_ref/index.html#resource-file).
      * @param {String} src The project resource path.
      * @param {String} target Resource destination in build.
-     * @param {String} [platform] Optional. A platform name (either `ios` or `android`, both if ommited) to add a resource-file entry.
+     * @param {String} [platform] Optional. A platform name (either `ios` or `android`, both if omitted) to add a resource-file entry.
      * @memberOf App
      */
     addResourceFile: function (src, target, platform) {

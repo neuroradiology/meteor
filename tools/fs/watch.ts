@@ -1,4 +1,4 @@
-import { Stats, FSWatcher } from "fs";
+import { Stats, BigIntStats, FSWatcher, Dirent } from "fs";
 import * as files from "./files";
 import * as safeWatcher from "./safe-watcher";
 import { createHash } from "crypto";
@@ -314,7 +314,7 @@ export class WatchSet {
 export function readFile(absPath: string) {
   try {
     return files.readFile(absPath);
-  } catch (e) {
+  } catch (e: any) {
     // Rethrow most errors.
     if (! e || (e.code !== 'ENOENT' && e.code !== 'EISDIR')) {
       throw e;
@@ -339,8 +339,8 @@ export const sha512 = Profile("sha512", function (...args: (string | Buffer)[]) 
 function readAndStatDirectory(absPath: string) {
   // Read the directory.
   try {
-    var contents = files.readdir(absPath);
-  } catch (e) {
+    var contents = files.readdirWithTypes(absPath);
+  } catch (e: any) {
     // If the path is not a directory, return null; let other errors through.
     if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) {
       return null;
@@ -351,9 +351,14 @@ function readAndStatDirectory(absPath: string) {
   // Add slashes to the end of directories.
   const contentsWithSlashes: string[] = [];
   contents.forEach(entry => {
-    // We do stat instead of lstat here, so that we treat symlinks to
-    // directories just like directories themselves.
-    const stat = optimisticStatOrNull(files.pathJoin(absPath, entry));
+    let stat: Dirent | Stats | BigIntStats | null | undefined = entry;
+    let name = entry.name;
+
+    if (entry.isSymbolicLink()) {
+      // We do stat instead of lstat here, so that we treat symlinks to
+      // directories just like directories themselves.
+      stat = optimisticStatOrNull(files.pathJoin(absPath, entry.name));
+    }
     if (! stat) {
       // Disappeared after the readdir (or a dangling symlink)?
       // Eh, pretend it was never there in the first place.
@@ -361,10 +366,10 @@ function readAndStatDirectory(absPath: string) {
     }
 
     if (stat.isDirectory()) {
-      entry += '/';
+      name += '/';
     }
 
-    contentsWithSlashes.push(entry);
+    contentsWithSlashes.push(name);
   });
 
   return contentsWithSlashes;
@@ -423,7 +428,7 @@ export class Watcher {
     watcher: safeWatcher.SafeWatcher | null;
     // Undefined until we stat the file for the first time, then null
     // if the file is observed to be missing.
-    lastStat?: Stats | null
+    lastStat?: Stats | BigIntStats | null
   }> = Object.create(null);
 
   constructor(options: {
@@ -613,7 +618,7 @@ export class Watcher {
       } else if (stat.isDirectory()) {
         try {
           var dirFiles = files.readdir(absPath);
-        } catch (err) {
+        } catch (err: any) {
           if (err.code === "ENOENT" ||
               err.code === "ENOTDIR") {
             // The directory was removed or changed type since we called
@@ -721,9 +726,9 @@ export class Watcher {
     return stat;
   }
 
-  // Iterates over the array, calling handleItem for each item
-  // When this._async is true, it pauses ocassionally to avoid blocking for too long
-  // Stops iterating after watcher is stopped
+  // Iterates over the array, calling handleItem for each item.
+  // When this._async is true, it pauses occasionally to avoid blocking for too long.
+  // Stops iterating after watcher is stopped.
   private processBatches<T>(
     array: T[],
     handleItem: (item: T) => any,
@@ -829,8 +834,8 @@ export function readAndWatchDirectory(
 ) {
   const contents = readDirectory(options);
   watchSet.addDirectory({
-    contents,
     ...options,
+    contents,
   });
   return contents;
 }
@@ -838,10 +843,6 @@ export function readAndWatchDirectory(
 // Calculating the sha hash can be expensive for large files.  By
 // returning the calculated hash along with the file contents, the
 // hash doesn't need to be calculated again for static files.
-//
-// We only calculate the hash if needed here, so callers must not
-// *rely* on the hash being returned; merely that if the hash is
-// present, it is the correct hash of the contents.
 export function readAndWatchFileWithHash(watchSet: WatchSet, absPath: string) {
   const result: {
     contents: string | Buffer | null;
@@ -853,7 +854,7 @@ export function readAndWatchFileWithHash(watchSet: WatchSet, absPath: string) {
 
   try {
     result.contents = files.readFile(absPath);
-  } catch (e) {
+  } catch (e: any) {
     if (e && e.code === "EISDIR") {
       // Avoid adding directories to the watchSet as files.
       return result;

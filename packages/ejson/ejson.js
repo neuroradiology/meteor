@@ -384,11 +384,11 @@ EJSON.fromJSONValue = item => {
  * @locus Anywhere
  * @param {EJSON} val A value to stringify.
  * @param {Object} [options]
- * @param {Boolean | Integer | String} options.indent Indents objects and
+ * @param {Boolean | Integer | String} [options.indent] Indents objects and
  * arrays for easy readability.  When `true`, indents by 2 spaces; when an
  * integer, indents by that number of spaces; and when a string, uses the
  * string as the indentation pattern.
- * @param {Boolean} options.canonical When `true`, stringifies keys in an
+ * @param {Boolean} [options.canonical] When `true`, stringifies keys in an
  *                                    object in sorted order.
  */
 EJSON.stringify = handleError((item, options) => {
@@ -486,10 +486,16 @@ EJSON.equals = (a, b, options) => {
     return b.equals(a, options);
   }
 
-  if (a instanceof Array) {
-    if (!(b instanceof Array)) {
-      return false;
-    }
+  // Array.isArray works across iframes while instanceof won't
+  const aIsArray = Array.isArray(a);
+  const bIsArray = Array.isArray(b);
+
+  // if not both or none are array they are not equal
+  if (aIsArray !== bIsArray) {
+    return false;
+  }
+
+  if (aIsArray && bIsArray) {
     if (a.length !== b.length) {
       return false;
     }

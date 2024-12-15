@@ -1,12 +1,14 @@
 var semver = Npm.require("semver");
 var JSON5 = Npm.require("json5");
+
 /**
  * A compiler that can be instantiated with features and used inside
  * Plugin.registerCompiler
  * @param {Object} extraFeatures The same object that getDefaultOptions takes
  */
-BabelCompiler = function BabelCompiler(extraFeatures) {
+BabelCompiler = function BabelCompiler(extraFeatures, modifyBabelConfig) {
   this.extraFeatures = extraFeatures;
+  this.modifyBabelConfig = modifyBabelConfig;
   this._babelrcCache = null;
   this._babelrcWarnings = Object.create(null);
   this.cacheDirectory = null;
@@ -19,6 +21,8 @@ var hasOwn = Object.prototype.hasOwnProperty;
 // There's no way to tell the current Meteor version, but we can infer
 // whether it's Meteor 1.4.4 or earlier by checking the Node version.
 var isMeteorPre144 = semver.lt(process.version, "4.8.1");
+
+var enableClientTLA = process.env.METEOR_ENABLE_CLIENT_TOP_LEVEL_AWAIT === 'true';
 
 BCp.processFilesForTarget = function (inputFiles) {
   var compiler = this;
@@ -79,7 +83,7 @@ BCp.processOneFileForTarget = function (inputFile, source) {
       // compilation, give it the following file extension: .es5.js
       ! excludedFileExtensionPattern.test(inputFilePath)) {
 
-    const features = { ...this.extraFeatures };
+    const features = Object.assign({}, this.extraFeatures);
     const arch = inputFile.getArch();
 
     if (arch.startsWith("os.")) {
@@ -89,6 +93,11 @@ BCp.processOneFileForTarget = function (inputFile, source) {
     } else if (arch === "web.browser") {
       features.modernBrowsers = true;
     }
+
+    features.topLevelAwait = inputFile.supportsTopLevelAwait &&
+       (arch.startsWith('os.') || enableClientTLA);
+
+    features.useNativeAsyncAwait = Meteor.isFibersDisabled;
 
     if (! features.hasOwnProperty("jscript")) {
       // Perform some additional transformations to improve compatibility
@@ -121,7 +130,7 @@ BCp.processOneFileForTarget = function (inputFile, source) {
     this.inferExtraBabelOptions(
       inputFile,
       babelOptions,
-      cacheOptions.cacheDeps,
+      cacheOptions.cacheDeps
     );
 
     babelOptions.sourceMaps = true;
@@ -129,6 +138,10 @@ BCp.processOneFileForTarget = function (inputFile, source) {
       babelOptions.sourceFileName = packageName
       ? "packages/" + packageName + "/" + inputFilePath
       : inputFilePath;
+
+    if (this.modifyBabelConfig) {
+      this.modifyBabelConfig(babelOptions, inputFile);
+    }
 
     try {
       var result = profile('Babel.compile', function () {

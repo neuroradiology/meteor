@@ -1,4 +1,4 @@
-var url = Npm.require('url');
+import once from 'lodash.once';
 
 // By default, we use the permessage-deflate extension with default
 // configuration. If $SERVER_WEBSOCKET_COMPRESSION is set, then it must be valid
@@ -11,7 +11,7 @@ var url = Npm.require('url');
 // crash the tool during isopacket load if your JSON doesn't parse. This is only
 // a problem because the tool has to load the DDP server code just in order to
 // be a DDP client; see https://github.com/meteor/meteor/issues/3452 .)
-var websocketExtensions = _.once(function () {
+var websocketExtensions = once(function () {
   var extensions = [];
 
   var websocketCompressionConfig = process.env.SERVER_WEBSOCKET_COMPRESSION
@@ -52,6 +52,9 @@ StreamServer = function () {
     // combining CPU-heavy processing with SockJS termination (eg a proxy which
     // converts to Unix sockets) but for now, raise the delay.
     disconnect_delay: 60 * 1000,
+    // Allow disabling of CORS requests to address
+    // https://github.com/meteor/meteor/issues/8317.
+    disable_cors: !!process.env.DISABLE_SOCKJS_CORS,
     // Set the USE_JSESSIONID environment variable to enable setting the
     // JSESSIONID cookie. This is useful for setting up proxies with
     // session affinity.
@@ -115,33 +118,34 @@ StreamServer = function () {
       socket.write(data);
     };
     socket.on('close', function () {
-      self.open_sockets = _.without(self.open_sockets, socket);
+      self.open_sockets = self.open_sockets.filter(function(value) {
+        return value !== socket;
+      });
     });
     self.open_sockets.push(socket);
 
-    // XXX COMPAT WITH 0.6.6. Send the old style welcome message, which
-    // will force old clients to reload. Remove this once we're not
-    // concerned about people upgrading from a pre-0.7.0 release. Also,
-    // remove the clause in the client that ignores the welcome message
-    // (livedata_connection.js)
-    socket.send(JSON.stringify({server_id: "0"}));
+    // only to send a message after connection on tests, useful for
+    // socket-stream-client/server-tests.js
+    if (process.env.TEST_METADATA && process.env.TEST_METADATA !== "{}") {
+      socket.send(JSON.stringify({ testMessageOnConnect: true }));
+    }
 
     // call all our callbacks when we get a new socket. they will do the
     // work of setting up handlers and such for specific messages.
-    _.each(self.registration_callbacks, function (callback) {
+    self.registration_callbacks.forEach(function (callback) {
       callback(socket);
     });
   });
 
 };
 
-_.extend(StreamServer.prototype, {
+Object.assign(StreamServer.prototype, {
   // call my callback when a new socket connects.
   // also call it for all current connections.
   register: function (callback) {
     var self = this;
     self.registration_callbacks.push(callback);
-    _.each(self.all_sockets(), function (socket) {
+    self.all_sockets().forEach(function (socket) {
       callback(socket);
     });
   },
@@ -149,7 +153,7 @@ _.extend(StreamServer.prototype, {
   // get a list of all sockets
   all_sockets: function () {
     var self = this;
-    return _.values(self.open_sockets);
+    return Object.values(self.open_sockets);
   },
 
   // Redirect /websocket to /sockjs/websocket in order to not expose
@@ -161,7 +165,7 @@ _.extend(StreamServer.prototype, {
     // (meaning prior to any connect middlewares) so we need to take
     // an approach similar to overshadowListeners in
     // https://github.com/sockjs/sockjs-node/blob/cf820c55af6a9953e16558555a31decea554f70e/src/utils.coffee
-    _.each(['request', 'upgrade'], function(event) {
+    ['request', 'upgrade'].forEach((event) => {
       var httpServer = WebApp.httpServer;
       var oldHttpServerListeners = httpServer.listeners(event).slice(0);
       httpServer.removeAllListeners(event);
@@ -172,6 +176,9 @@ _.extend(StreamServer.prototype, {
         // Store arguments for use within the closure below
         var args = arguments;
 
+        // TODO replace with url package
+        var url = Npm.require('url');
+
         // Rewrite /websocket and /websocket/ urls to /sockjs/websocket while
         // preserving query string.
         var parsedUrl = url.parse(request.url);
@@ -180,7 +187,7 @@ _.extend(StreamServer.prototype, {
           parsedUrl.pathname = self.prefix + '/websocket';
           request.url = url.format(parsedUrl);
         }
-        _.each(oldHttpServerListeners, function(oldListener) {
+        oldHttpServerListeners.forEach(function(oldListener) {
           oldListener.apply(httpServer, args);
         });
       };

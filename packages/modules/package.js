@@ -1,17 +1,18 @@
 Package.describe({
   name: "modules",
-  version: "0.15.0",
+  version: '0.20.3',
   summary: "CommonJS module system",
   documentation: "README.md"
 });
 
 Npm.depends({
-  reify: "0.20.12",
-  "meteor-babel-helpers": "0.0.3"
+  "@meteorjs/reify": "0.25.4",
+  "meteor-babel-helpers": "0.0.3",
 });
 
 Package.onUse(function(api) {
   api.use("modules-runtime");
+  api.use("modules-runtime-hot", { weak: true });
   api.mainModule("client.js", "client");
   api.mainModule("server.js", "server");
   api.export("meteorInstall");
